@@ -352,6 +352,11 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The table entries (`(user_data, table_offset_dwords)` of their used
+    /// resource) the shader may write through; `None` if it may write
+    /// through a table view whose entry is not known. What the others hold
+    /// need not go back into title memory.
+    pub written_tables: Option<Vec<(u8, u32)>>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -795,6 +800,7 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_tables: l.written_tables.clone(),
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1577,6 +1583,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_tables: None,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1589,6 +1596,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_tables: None,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -2198,6 +2206,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            written_tables: l.written_tables.clone(),
             root_indexed_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2351,6 +2360,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_tables: l.written_tables.clone(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2767,6 +2777,7 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_tables: None,
             root_indexed_views: Vec::new(),
         };
         validate(&vs);

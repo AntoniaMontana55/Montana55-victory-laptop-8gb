@@ -1,0 +1,412 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index c44f0369a8..09770163c0 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -206,7 +206,10 @@ pub(crate) fn dispatched() -> u64 {
+ /// to title memory after the submission.
+ /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
+ /// other views as 1 MiB (both cut at their buffer's end).
+-fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
++/// `writes`: the shader may write through the view (a root UAV it stores
++/// to), so what it writes goes back into title memory; a root UAV it only
++/// reads needs no snapshot and no compare after.
++fn root_view(list: &HostList, address: u64, srv: bool, uav: bool, writes: bool) -> Option<u64> {
+     let shadow = crate::shadow::find(address, 1)?;
+     let len = shadow
+         .left(address)
+@@ -214,7 +217,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
+     let gpu = shadow.gpu(address);
+     if srv || uav || gpu % 256 == 0 {
+         shadow.refresh(list, address, len);
+-        if uav {
++        if uav && writes {
+             // A host root descriptor: no heap view, so its writes are not
+             // marked.
+             shadow.gpu_writes(list, address, len, false);
+@@ -756,11 +759,13 @@ impl State {
+                             self.roots_ref(compute).get(usize::from(u.slot))
+                         && let Some(shadow) = crate::shadow::find(*address, 1)
+                     {
+-                        let uav = t.used.iter().any(|r| {
+-                            r.slot == u.slot
+-                                && r.root == RootType::Descriptor
+-                                && r.kind == ResourceType::Uav
+-                        });
++                        // A root UAV the shader writes through goes back.
++                        let uav = t.host.written_root_uavs.contains(&u.slot)
++                            && t.used.iter().any(|r| {
++                                r.slot == u.slot
++                                    && r.root == RootType::Descriptor
++                                    && r.kind == ResourceType::Uav
++                            });
+                         roots.push((*address, uav.then_some(shadow)));
+                     }
+                     let fresh = made
+@@ -833,7 +838,8 @@ impl State {
+                         once!(slot, "a shader reads a root view the title did not set");
+                         continue;
+                     };
+-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
++                    let writes = kind == 2 && t.host.written_root_uavs.contains(&slot);
++                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2, writes) else {
+                         continue;
+                     };
+                     // SAFETY: an open list; the address is in live memory.
+diff --git a/crates/victory-gpu/src/pipeline/depth_bounds_test.rs b/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
+index 2d429b9924..4fe375522a 100644
+--- a/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
++++ b/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
+@@ -65,6 +65,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
+             root_cbvs: Vec::new(),
+             root_srvs: Vec::new(),
+             root_uavs: Vec::new(),
++            written_root_uavs: Vec::new(),
+             memory: false,
+             memory_writes: false,
+             view_addresses: false,
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index fd09daa156..44d487085f 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -174,7 +174,9 @@ fn cached(
+     )
+ }
+ 
+-const MAGIC: &[u8; 4] = b"VSH1";
++/// The entry format: VSH2 added the written root UAVs (an entry of VSH1
++/// is translated again).
++const MAGIC: &[u8; 4] = b"VSH2";
+ /// A container that does not translate: the reason follows.
+ const REFUSED: &[u8; 4] = b"VSHE";
+ const STAGES: [HwStage; 8] = [
+@@ -230,6 +232,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
+         root_cbvs,
+         root_srvs,
+         root_uavs,
++        written_root_uavs,
+         memory,
+         memory_writes,
+         view_addresses,
+@@ -287,6 +290,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
+             | u32::from(*heap_writes) << 4
+             | u32::from(*view_marks) << 5,
+     );
++    word(&mut out, written_root_uavs.len() as u32);
++    out.extend(written_root_uavs);
+     out
+ }
+ 
+@@ -348,6 +353,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+     let root_srvs = r.list()?;
+     let root_uavs = r.list()?;
+     let memory = r.word()?;
++    let written_root_uavs = r.list()?;
+     r.0.is_empty().then_some(Ok(HostShader {
+         stage,
+         dxil,
+@@ -357,6 +363,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+         root_cbvs,
+         root_srvs,
+         root_uavs,
++        written_root_uavs,
+         memory: memory & 1 != 0,
+         memory_writes: memory & 2 != 0,
+         view_addresses: memory & 4 != 0,
+@@ -390,6 +397,7 @@ mod tests {
+             root_cbvs: vec![2],
+             root_srvs: vec![0, 3],
+             root_uavs: vec![4],
++            written_root_uavs: vec![4],
+             memory: true,
+             memory_writes: true,
+             view_addresses: true,
+diff --git a/crates/victory-shader/src/emit/bvh_tests.rs b/crates/victory-shader/src/emit/bvh_tests.rs
+index c099af070b..3a7ec7420a 100644
+--- a/crates/victory-shader/src/emit/bvh_tests.rs
++++ b/crates/victory-shader/src/emit/bvh_tests.rs
+@@ -604,6 +604,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+diff --git a/crates/victory-shader/src/emit/crosslane_tests.rs b/crates/victory-shader/src/emit/crosslane_tests.rs
+index 3b1a129fb7..5c729f6ce9 100644
+--- a/crates/victory-shader/src/emit/crosslane_tests.rs
++++ b/crates/victory-shader/src/emit/crosslane_tests.rs
+@@ -423,6 +423,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index da16ad7d2c..83fc0b7aeb 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -808,6 +808,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+@@ -907,6 +908,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
+         root_cbvs: Vec::new(),
+         root_srvs: Vec::new(),
+         root_uavs: Vec::new(),
++        written_root_uavs: Vec::new(),
+         memory: false,
+         memory_writes: false,
+         view_addresses: false,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index c96f522ec8..e27425fa01 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -38,6 +38,8 @@ pub(crate) struct Lowered {
+     pub root_cbvs: Vec<u8>,
+     pub root_srvs: Vec<u8>,
+     pub root_uavs: Vec<u8>,
++    /// Root UAVs among `root_uavs` an operation may write.
++    pub written_root_uavs: Vec<u8>,
+     /// Reads title memory at computed addresses (the page table).
+     pub memory: bool,
+     /// Writes there (the written-pages bitmap).
+@@ -1394,6 +1396,7 @@ impl<'a> Lower<'a> {
+             root_cbvs,
+             root_srvs,
+             root_uavs,
++            written_root_uavs: self.s.written_root_uavs.clone(),
+             memory,
+             memory_writes,
+             view_addresses,
+diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
+index 9224518fe1..028ac9a44a 100644
+--- a/crates/victory-shader/src/emit/memory_tests.rs
++++ b/crates/victory-shader/src/emit/memory_tests.rs
+@@ -202,6 +202,7 @@ fn program() -> HostShader {
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+@@ -437,6 +438,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+@@ -572,6 +574,7 @@ fn writes_through_views_mark_their_pages() {
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+@@ -705,6 +708,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+@@ -812,6 +816,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 91a5e64b98..25857e96b8 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -302,6 +302,9 @@ pub struct HostShader {
+     /// Root UAVs (raw buffers) the host binds as root descriptors:
+     /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
+     pub root_uavs: Vec<u8>,
++    /// The root UAVs among `root_uavs` the shader may write: what it only
++    /// reads through the others need not go back into title memory.
++    pub written_root_uavs: Vec<u8>,
+     /// Whether the shader reads title memory at addresses it computes: the
+     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
+     /// "Title memory").
+@@ -531,6 +534,7 @@ pub fn emit_with(
+         root_cbvs: l.root_cbvs,
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
++        written_root_uavs: l.written_root_uavs,
+         memory: l.memory,
+         memory_writes: l.memory_writes,
+         view_addresses: l.view_addresses,
+@@ -1064,6 +1068,7 @@ mod tests {
+             root_cbvs: Vec::new(),
+             root_srvs: Vec::new(),
+             root_uavs: Vec::new(),
++            written_root_uavs: Vec::new(),
+             memory: false,
+             memory_writes: false,
+             view_addresses: false,
+@@ -1081,6 +1086,7 @@ mod tests {
+                 root_cbvs: Vec::new(),
+                 root_srvs: Vec::new(),
+                 root_uavs: Vec::new(),
++                written_root_uavs: Vec::new(),
+                 memory: false,
+                 memory_writes: false,
+                 view_addresses: false,
+diff --git a/crates/victory-shader/src/emit/semantics_tests.rs b/crates/victory-shader/src/emit/semantics_tests.rs
+index c347a6297c..74b9cd925f 100644
+--- a/crates/victory-shader/src/emit/semantics_tests.rs
++++ b/crates/victory-shader/src/emit/semantics_tests.rs
+@@ -304,6 +304,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 441dae7435..6545dbacbf 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -119,6 +119,8 @@ pub(crate) struct Shader {
+     pub root_srvs: Vec<(u8, V)>,
+     /// Root UAVs (raw buffers) read or written, likewise.
+     pub root_uavs: Vec<(u8, V)>,
++    /// Root UAVs among them that an operation may write ([`Shader::op`]).
++    pub written_root_uavs: Vec<u8>,
+     /// The title-memory page table's handle, once read.
+     pub memory: Option<V>,
+     /// The written-pages bitmap's handle, once title memory is written.
+@@ -195,6 +197,7 @@ impl Shader {
+             root_cbvs: Vec::new(),
+             root_srvs: Vec::new(),
+             root_uavs: Vec::new(),
++            written_root_uavs: Vec::new(),
+             memory: None,
+             memory_dirty: None,
+             view_addresses: None,
+@@ -236,6 +239,16 @@ impl Shader {
+         opcode: u32,
+         args: &[V],
+     ) -> V {
++        // A root UAV is written by any operation on its handle but a read
++        // (BufferLoad, GetDimensions, RawBufferLoad): stores, atomics and
++        // operations to come are taken as writes.
++        if !matches!(opcode, 68 | 72 | 139)
++            && let Some(first) = args.first()
++            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
++            && !self.written_root_uavs.contains(&slot)
++        {
++            self.written_root_uavs.push(slot);
++        }
+         let mut params = vec![self.t.i32];
+         params.extend(args.iter().map(|&a| self.m.type_of(a)));
+         let fty = self.m.func_ty(ret, params);
+@@ -1043,6 +1056,28 @@ mod tests {
+     use super::super::bitcode::Term;
+     use super::*;
+ 
++    /// Of three root UAVs, the one only read (a raw load) is not written;
++    /// one stored to and one an atomic reaches are.
++    #[test]
++    fn only_root_uavs_stored_to_or_reached_by_atomics_are_written() {
++        let mut s = Shader::new(false);
++        let input = s.root_uav_handle(1);
++        let output = s.root_uav_handle(2);
++        let counter = s.root_uav_handle(3);
++        let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
++        let undef = s.m.undef(s.t.i32);
++        let (b, rr, void, i32t) = (s.entry, s.t.res_ret, s.t.void, s.t.i32);
++        for handle in [input, output] {
++            let args = [handle, zero, undef, mask, align];
++            s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, rr, 139, &args);
++        }
++        let args = [output, zero, undef, one, undef, undef, undef, mask, align];
++        s.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
++        let args = [counter, zero, zero, undef, undef, one];
++        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
++        assert_eq!(s.written_root_uavs, [2, 3]);
++    }
++
+     /// A program that sets a bit through the write marks' UAV, or (`heap`)
+     /// through a UAV indexed from the heap: a vertex (`pixel` false, no
+     /// thread-group size), pixel or compute program.
+diff --git a/crates/victory-shader/src/emit/stride_tests.rs b/crates/victory-shader/src/emit/stride_tests.rs
+index 20615b2e50..9e4912d2bd 100644
+--- a/crates/victory-shader/src/emit/stride_tests.rs
++++ b/crates/victory-shader/src/emit/stride_tests.rs
+@@ -214,6 +214,7 @@ fn build(
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
+index e6cee0dada..c249e33c39 100644
+--- a/crates/victory-shader/src/emit/synthetic_tests.rs
++++ b/crates/victory-shader/src/emit/synthetic_tests.rs
+@@ -117,6 +117,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+@@ -907,6 +908,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+             root_cbvs: l.root_cbvs,
+             root_srvs: l.root_srvs,
+             root_uavs: l.root_uavs,
++            written_root_uavs: l.written_root_uavs,
+             memory: l.memory,
+             memory_writes: l.memory_writes,
+             view_addresses: l.view_addresses,
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 182aea707a..76e04fb3f2 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -162,6 +162,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+@@ -1733,6 +1734,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index a226d5994b..4e728253ca 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -84,6 +84,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+         root_cbvs: lowered.root_cbvs,
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
++        written_root_uavs: lowered.written_root_uavs,
+         memory: lowered.memory,
+         memory_writes: lowered.memory_writes,
+         view_addresses: lowered.view_addresses,

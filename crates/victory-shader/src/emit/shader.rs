@@ -217,6 +217,15 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Heap handles of views read from descriptor tables, with the used
+    /// resource they fall in as `(user_data, table_offset_dwords)`, or
+    /// `None` when that is not one entry (a view picked among several).
+    pub table_handles: std::collections::HashMap<V, Option<(u8, u32)>>,
+    /// The table entries an operation may write through ([`Shader::op`]).
+    pub written_tables: Vec<(u8, u32)>,
+    /// An operation may write through a table view whose entry is not
+    /// known: every table view the shader names must be taken as written.
+    pub written_tables_unknown: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -274,6 +283,9 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            table_handles: std::collections::HashMap::new(),
+            written_tables: Vec::new(),
+            written_tables_unknown: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -307,6 +319,20 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // A table view is written by any operation on its handle that is not
+        // known to only read (loads, samples, gathers, sizes): stores,
+        // atomics, counters and operations to come count as writes.
+        const READS: [u32; 17] = [59, 60, 61, 62, 63, 64, 65, 66, 68, 71, 72, 73, 74, 81, 139, 222, 223];
+        if !READS.contains(&opcode)
+            && let Some(first) = args.first()
+            && let Some(entry) = self.table_handles.get(first)
+        {
+            match entry {
+                Some(e) if !self.written_tables.contains(e) => self.written_tables.push(*e),
+                Some(_) => {}
+                None => self.written_tables_unknown = true,
+            }
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

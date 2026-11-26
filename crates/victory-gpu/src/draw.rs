@@ -66,6 +66,14 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: the table entries its shader may
+    /// write through (`HostShader::written_tables`, as a pointer and length
+    /// into the stage's translation, which outlives the walk); `None`: any.
+    static TABLE_WRITES: std::cell::Cell<Option<(*const (u8, u32), usize)>> =
+        const { std::cell::Cell::new(None) };
+    /// While one table entry is made readable: whether the shader may write
+    /// through it ([`entry_may_write`]).
+    static ENTRY_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -151,6 +159,41 @@ pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), Ato
 fn write_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
+}
+
+/// Whether a table entry's unordered access view is given to shaders as
+/// written only if the shader's code writes through that entry (the
+/// translator notes which, `HostShader::written_tables`), not whenever it
+/// stores to any buffer. The title binds tables whose shaders store through
+/// one view and only read the rest: 240 MB a frame compared back with no
+/// piece found changed (prison cell, 26.11). On by default;
+/// `VICTORY_TABLE_WRITES_PRECISE=0` declares every entry of a storing
+/// shader, as before.
+fn table_writes_precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_WRITES_PRECISE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the stage whose tables are walked may write through entry `u`.
+fn entry_may_write(u: &UsedResource) -> bool {
+    if !table_writes_precise() {
+        return true;
+    }
+    match TABLE_WRITES.get() {
+        None => true,
+        // SAFETY: set by `State::bind` from the stage's translation, which it
+        // holds for the whole walk, and cleared before that ends.
+        Some((at, len)) => unsafe { std::slice::from_raw_parts(at, len) }
+            .contains(&(u.user_data, u.table_offset_dwords)),
+    }
+}
+
+/// [`readable`] for a table entry: declared written only if the shader may
+/// write through it.
+fn readable_entry(list: &HostList, u: &UsedResource, view: &View) {
+    ENTRY_WRITES.set(entry_may_write(u));
+    readable(list, u.kind, view);
+    ENTRY_WRITES.set(true);
 }
 
 /// A run of indirect records clamped in one pass ([`windows`]): the host
@@ -1490,10 +1533,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            TABLE_WRITES.set(t.host.written_tables.as_ref().map(|w| (w.as_ptr(), w.len())));
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            TABLE_WRITES.set(None);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3124,7 +3169,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_entry(list, u, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3267,7 +3312,7 @@ impl State {
                 for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable_entry(list, u, &view);
                     }
                 }
                 for k in selected {
@@ -4130,7 +4175,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if STORES.get() && ENTRY_WRITES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);

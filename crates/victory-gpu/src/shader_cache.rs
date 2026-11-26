@@ -176,7 +176,9 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// The entry format: VSH2 added the table entries a shader may write
+/// (an entry of VSH1 is translated again).
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -267,6 +269,18 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    // The table entries it may write: their count (`u32::MAX`: not known),
+    // then each entry's user data slot and table offset.
+    match &s.written_tables {
+        None => word(&mut out, u32::MAX),
+        Some(entries) => {
+            word(&mut out, entries.len() as u32);
+            for &(user_data, offset) in entries {
+                word(&mut out, u32::from(user_data));
+                word(&mut out, offset);
+            }
+        }
+    }
     out
 }
 
@@ -335,6 +349,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let written_tables = match r.word()? {
+        u32::MAX => None,
+        n => {
+            let mut entries = Vec::with_capacity((n as usize).min(256));
+            for _ in 0..n {
+                entries.push((u8::try_from(r.word()?).ok()?, r.word()?));
+            }
+            Some(entries)
+        }
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -344,6 +368,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_tables,
         root_indexed_views,
     })
 }
@@ -372,6 +397,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            written_tables: Some(vec![(2, 8), (3, 16)]),
             root_indexed_views: vec![RootIndexedView {
                 table_slot: 1,
                 constant_slot: 2,

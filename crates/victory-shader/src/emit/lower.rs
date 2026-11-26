@@ -55,6 +55,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// The table entries the shader may write through, or `None` if it may
+    /// write through one not known ([`HostShader::written_tables`]).
+    pub written_tables: Option<Vec<(u8, u32)>>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2422,12 +2425,14 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let written_tables = (!self.s.written_tables_unknown).then(|| self.s.written_tables.clone());
         Ok(Lowered {
             wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_tables,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -7162,8 +7167,43 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A handle for the descriptor `src` read at `site`.
+    /// A handle for the descriptor `src` read at `site`; a view read from a
+    /// table is noted with the used resource it falls in, so that what the
+    /// shader writes through it is known by entry ([`Shader::op`]).
     fn handle(
+        &mut self,
+        site: Site,
+        src: &Source,
+        sampler: bool,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        let h = self.handle_made(site, src, sampler, props)?;
+        if !sampler && !matches!(src, Source::Built { .. } | Source::Constant(_)) {
+            let entry = self.table_entry_of(src);
+            let noted = self.s.table_handles.entry(h).or_insert(entry);
+            if *noted != entry {
+                // One handle, two entries: neither can be told apart.
+                *noted = None;
+            }
+        }
+        Ok(h)
+    }
+
+    /// The one table entry (`(user_data, table_offset_dwords)` of its used
+    /// resource) descriptor `src` is read from, or `None` if it may be any
+    /// of several or none is known.
+    fn table_entry_of(&self, src: &Source) -> Option<(u8, u32)> {
+        let one = |s: &Source| {
+            self.used_kind(s)
+                .filter(|u| u.root == RootType::Table)
+                .map(|u| (u.user_data, u.table_offset_dwords))
+        };
+        let all: Vec<Option<(u8, u32)>> = src.leaves().into_iter().map(one).collect();
+        let first = *all.first()?;
+        all.iter().all(|e| *e == first).then_some(first).flatten()
+    }
+
+    fn handle_made(
         &mut self,
         site: Site,
         src: &Source,
