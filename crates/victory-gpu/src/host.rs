@@ -3675,6 +3675,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::launch::line(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(

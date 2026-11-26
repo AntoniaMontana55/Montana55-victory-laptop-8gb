@@ -3056,8 +3056,9 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    let p = crate::pipeline::host_pipeline(self.pipeline as This);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    if let Some(p) = p {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3065,9 +3066,16 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                    // With the launch stage the count goes to it as a root
+                    // constant (`crate::launch`).
+                    match p.and_then(|p| p.launch.as_ref()) {
+                        Some(launch) => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
+                    }
+                    self.drew(list, p);
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3833,6 +3841,48 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // One mesh record of a pipeline with the launch stage: the draw
+        // reads it itself (`crate::launch`), no clamp of ours before it.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+        {
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            if crate::indirect::gather_enabled() {
+                list.gather_close();
+                self.batch = None;
+            }
+            self.window = None;
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false)
+            });
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no budget for the launch");
+                return false;
+            }
+            self.drew(list, Some(p));
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let offset = args.offset(arguments);
         let gather = crate::indirect::gather_enabled();
         let gatherable = gather && kind != DISPATCH && max == 1 && count.is_none()
@@ -3960,6 +4010,21 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record): the same pipeline without the stage.
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

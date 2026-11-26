@@ -12,6 +12,31 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload a translated mesh shader declares and never reads
+/// when `VICTORY_MESH_LAUNCH=1`. The host puts an amplification shader of
+/// its own in front of it (`victory-gpu`'s `launch`), whose payload must
+/// have the size the mesh shader declares: a mesh shader that declares none
+/// is refused with one (the RTX 5080's driver returns `E_INVALIDARG`), and
+/// one that declares a payload is still taken without an amplification shader.
+pub const MESH_PAYLOAD_BYTES: u32 = 4;
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
+
+/// Payload size (in bytes) declared by translated mesh shaders. Off by default
+/// (0 bytes, bit-for-bit identical to before); `VICTORY_MESH_LAUNCH=1` emits
+/// [`MESH_PAYLOAD_BYTES`] so the host's amplification shader can bound indirect
+/// mesh draws without a separate clamp compute pass (fablinoo/kelvaroq 32c4ab4fe9).
+pub fn mesh_launch_payload() -> u32 {
+    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        if std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1") {
+            MESH_PAYLOAD_BYTES
+        } else {
+            0
+        }
+    })
+}
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -852,7 +877,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_launch_payload(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

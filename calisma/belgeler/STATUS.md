@@ -14,6 +14,7 @@ G0c. [RET 13:45] LOOP_LIMIT=4096: 159.3 → 158.8 ms (temiz çift), llb kirli. D
 G0d. [KABUL 14:10] CLAMP_WAITS=0: cwb 149.3 → 143.0 ms, p90 250 → 146; görüntü aynı. kw serisi bitince kosu.ps1 tabanına eklenecek (seri ortasında taban değişmesin).
 G0e. [sırada, otomatik] CARD_WINDOWS_MB=768 (KODSUZ; varsayılan 0 = shader'ların okuduğu pencereler sistem RAM'inde kalıyordu!) kwa/kwb. Kanıt: #2705 CARD_COPIES ProbeGather 908 → 350 ms; GTX 1660 271 → 100 ms. Not: kapı "kartın beşte biri boşsa" — bizde ~0.9 GB boş, taşımayabilir; log'da pencere sayısına bak.
 G0f. [Neon portluyor 14:05] kelvaroq MESH_LAUNCH (5080 ağır kare 198 → 120 ms, GPU %78 → 35). Sonra AnyXboxX INDIRECT_RAW=3. Portwatch taraması: 118 repo, 9 x 404; güvenlik: kelvaroq ZIP, Cold Project Lanceur.exe, AnyXboxX EXE, kellysix/kelly (1 günlük, kaynak yok) → hiçbiri çalıştırılmaz.
+G0f2. [koşuyor 14:40] MESH_LAUNCH (Neon portu 84273df; launch_code.rs baytları kendi dxc'mizle yeniden üretildi — fork'un baytları aynı boyut farklı içerikti, kullanılmadı). ml0-isinma + mla/mlb. Sonra: doku blok havuzundaki 1147 MB boş yeri küçült → pencerelere yer aç → CARD_WINDOWS_MB tekrar.
 GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
