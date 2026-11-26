@@ -112,7 +112,10 @@ $env:VICTORY_CARD_STEPS               = '2'
 $env:VICTORY_CARD_AWAKE               = '0'
 $env:VICTORY_MAP_THREADS              = '1'
 $env:VICTORY_TITLE_PRIORITIES         = '0'
-$env:VICTORY_TEXTURE_NO_WAIT          = '1'
+# Remap kilidi tutulurken kernel okumasina gecme: eksik sayfa iyi mip'in
+# uzerine sifir yaziyor (texture.rs:376-388). Doku butunlugu once gelir.
+$env:VICTORY_TEXTURE_NO_WAIT          = '0'
+$env:VICTORY_TEXTURE_FILL             = '0'
 $env:VICTORY_SEND_KEPT_MB             = '128'
 $env:VICTORY_WINDOW_KB                = '256'
 $env:VICTORY_WINDOW_TAILS             = '1'
@@ -218,7 +221,14 @@ $env:VICTORY_CLAMP_WAITS      = 'ON'
 
 # === UPSCALER & CIKIS GUVENLIGI ===
 if ($useFsr -and $consoleProfile -eq 'series-s') {
-    $env:VICTORY_UPSCALER = '7'
+    # FSR4 yalniz 1280x720 render kabul ediyor; 0.75 olcek 960x540/768x432
+    # uretip "Shipping FSR4 configuration mismatch" ve device removal veriyor.
+    $outRes = '1280x720'
+    $scale  = '1.0'
+    $env:VICTORY_UPSCALER     = '7'
+    $env:VICTORY_OUTPUT       = $outRes
+    $env:VICTORY_RENDER_SCALE = $scale
+    $env:VICTORY_RESOLUTION   = $outRes
     $presetLabel = "$Preset [FSR4 Sabit 1280x720 -> 1080p]"
 } else {
     $env:VICTORY_UPSCALER = '6'
