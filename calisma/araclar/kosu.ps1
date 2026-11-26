@@ -8,7 +8,14 @@ param(
     [hashtable]$Ek = @{},
     [double]$Dakika = 4.5,
     [string]$VictoryExe = 'C:\CLLL\.calisma\vw-avatar\target\diag\victory.exe',
-    [switch]$DryRun
+    [switch]$DryRun,
+    # Bizim taban ayarlarını kaldır, yalnız -Ek uygula (başka bir build'i kendi ayar setiyle ölçmek için; ör. Neptune).
+    [switch]$TabanYok,
+    # Dünya göründükten kaç sn sonra koşu biter (0 = Dakika dolana kadar).
+    [int]$DunyaSn = 80,
+    # Betikli tuş(lar): bizde Enter = klavye Enter + pad A. Neptune'de pad A = Space (gameinput.rs A_KEY) ama ara sahne
+    # klavye Enter'ı basılı tutarak geçiliyor → Neptune için 'Enter,Space' (ikisi birden).
+    [string[]]$Tus = @('Enter')
 )
 $ErrorActionPreference = 'Stop'
 
@@ -47,11 +54,11 @@ $taban = [ordered]@{
     VICTORY_WINDOWS_BAR_PERCENT = '88'
 }
 $set = @{}
-foreach ($k in $taban.Keys) { $set[$k] = $taban[$k] }
+foreach ($k in $taban.Keys) { $set[$k] = if ($TabanYok) { $null } else { $taban[$k] } }
 foreach ($k in $Ek.Keys) { $set[$k] = $Ek[$k] }
 
 # Enter deseni (Yiğit "unutma", 26.11): 20-150 sn, 2.5 sn basılı / 0.5 sn bırak (intro/hikâye basılı-tut ile atlanır).
-$tuslar = @(for ($t = 20; $t -lt 149; $t += 3) { "$t-$($t + 2.5):Enter" }) + '149-150:Enter'
+$tuslar = foreach ($k in $Tus) { @(for ($t = 20; $t -lt 149; $t += 3) { "$t-$($t + 2.5):$k" }) + "149-150:$k" }
 
 $arg = @{
     Keys           = $tuslar -join ','
@@ -76,5 +83,10 @@ if (-not $DryRun) {
     # PC kullanımı kaydı (26.11): Yiğit koşu sırasında PC'yi kullanabilir; bozulan koşuyu bu kayıt ayıklar.
     Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
         (Join-Path $PSScriptRoot 'kullanim_izle.ps1'), '-Tag', $Tag, '-Dakika', ($Dakika + 2) | Out-Null
+    # Dünya göründükten DunyaSn sonra bitir (Yiğit 26.11: fps oturuyor; 0 = tam süre, ör. profil koşuları).
+    if ($DunyaSn -gt 0) {
+        Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $PSScriptRoot 'dunya_sonra_dur.ps1'), '-Tag', $Tag, '-Saniye', $DunyaSn | Out-Null
+    }
 }
 & (Join-Path $PSScriptRoot 'olcum_profili.ps1') @arg

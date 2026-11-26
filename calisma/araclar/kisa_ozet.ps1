@@ -3,7 +3,9 @@
 param(
     [Parameter(Mandatory)][string]$Kosu,
     [int]$Saniye = 200,
-    [int]$DunyaSonra = 0
+    [int]$DunyaSonra = 0,
+    # Dünyanın ilk kaç saniyesi medyana girmez (yükleme sonrası oturma; 26.11 kısa koşular).
+    [int]$Isinma = 20
 )
 $ErrorActionPreference = 'Stop'
 $log = Join-Path $Kosu 'run.log'
@@ -21,11 +23,13 @@ $kareler = Select-String -Path $log -Pattern 'host: ([\d.]+) fps, ([\d.]+) ms/fr
 }
 $dunya = @($kareler | Where-Object { $_.Draw -ge 2000 })
 $ilkDunya = if ($dunya.Count) { [int]($dunya[0].T - $bas).TotalSeconds } else { -1 }
+$ilkT = if ($dunya.Count) { $dunya[0].T } else { $null }
+if ($dunya.Count) { $dunya = @($dunya | Where-Object { ($_.T - $ilkT).TotalSeconds -ge $Isinma }) }
 $medyan = if ($dunya.Count) { ($dunya.Ms | Sort-Object)[[int][math]::Floor($dunya.Count / 2)] } else { 0 }
 $p90 = if ($dunya.Count) { ($dunya.Ms | Sort-Object)[[int][math]::Floor($dunya.Count * 0.9)] } else { 0 }
 
 # -DunyaSonra verilirse hedef = ilk dünya karesi + o kadar saniye (Enter deseni farklı koşular için).
-if ($DunyaSonra -gt 0 -and $dunya.Count) { $hedef = $dunya[0].T.AddSeconds($DunyaSonra) }
+if ($DunyaSonra -gt 0 -and $ilkT) { $hedef = $ilkT.AddSeconds($DunyaSonra) }
 # Hedef saniyeye en yakın bellek satırları.
 function En-Yakin($desen) {
     $s = Select-String -Path $log -Pattern $desen | ForEach-Object { [pscustomobject]@{ T = & $zaman $_.Line; L = $_.Line } }
@@ -53,8 +57,10 @@ if (Test-Path $kul) {
         $onde = 100.0 * @($k | Where-Object { $_.on_surec -match '^(victory|game_scarlett_master)$' }).Count / $k.Count
         $cpu = $k | ForEach-Object { [double]::Parse($_.diger_cpu_cekirdek, [Globalization.CultureInfo]::InvariantCulture) } | Measure-Object -Average -Maximum
         $digerOn = ($k | Where-Object { $_.on_surec -notmatch '^(victory|game_scarlett_master)$' } | Group-Object on_surec | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) $([int](2 * $_.Count)) sn" }) -join ', '
-        $kirli = $onde -lt 90 -or $cpu.Average -gt 1.5
-        "kullanım: oyun önde %{0:N0}, diğer programlar CPU ort {1:N1} / tepe {2:N1} çekirdek{3}{4}" -f $onde, $cpu.Average, $cpu.Maximum, $(if ($digerOn) { " | önde: $digerOn" } else { '' }), $(if ($kirli) { ' | ⚠ KİRLİ' } else { ' | temiz' })
+        # Oyun arkada da normal çalışıyor (26.11 T1: hep %1-4 önde); ölçüt yalnız başka programların CPU'su ve boş RAM.
+        $bosEn = ($k | ForEach-Object { [double]::Parse($_.bos_ram_gb, [Globalization.CultureInfo]::InvariantCulture) } | Measure-Object -Minimum).Minimum
+        $kirli = $cpu.Average -gt 3.0 -or $bosEn -lt 0.15
+        "kullanım: oyun önde %{0:N0}, diğer programlar CPU ort {1:N1} / tepe {2:N1} çekirdek, boş RAM en az {5:N2} GB{3}{4}" -f $onde, $cpu.Average, $cpu.Maximum, $(if ($digerOn) { " | önde: $digerOn" } else { '' }), $(if ($kirli) { ' | ⚠ KİRLİ' } else { ' | temiz' }), $bosEn
     }
 }
 "{0} | ilk dünya {1} sn | dünya n={2} medyan {3} ms ({4:N1} fps) p90 {5} | @{6} sn: kilitli paylaşım {7} MB, kart {8} MB, {9}, {10}" -f $ad, $ilkDunya, $dunya.Count, $medyan, (1000 / [math]::Max($medyan, 1)), $p90, $an, $kilitli, $kart, $pen, $priv
