@@ -1240,6 +1240,7 @@ pub(crate) struct HostList {
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
+    gather: Mutex<GatherPrelude>,
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
@@ -1257,6 +1258,13 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// Batch passes recorded into the prelude, before any title commands.
+#[derive(Default)]
+struct GatherPrelude {
+    closed: bool,
+    batches: Vec<(crate::indirect::batch::Table, crate::indirect::BatchPass)>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2311,6 +2319,8 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// The prelude, rather than the title list, starts the card budget.
+    budget_in_prelude: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -4118,6 +4128,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
+                gather: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
@@ -6263,6 +6274,7 @@ impl HostList {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
+        *self.gather.lock().unwrap_or_else(|e| e.into_inner()) = GatherPrelude::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6628,7 +6640,10 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // A gathered pass first reserves its budget, so this also
+        // covers a prelude that only needs to zero the card budget.
+        let budget_in_prelude = self.deferred().budget_in_prelude;
+        if barriers.is_empty() && syncs.is_empty() && !budget_in_prelude {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6638,6 +6653,8 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
+        let gather = budget_in_prelude
+            .then(|| self.gather.lock().unwrap_or_else(|e| e.into_inner()));
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
@@ -6651,6 +6668,16 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if budget_in_prelude
+                    && let Some(Some(card)) = self.card_budget.get()
+                {
+                    Self::zero_card_budget(list, card);
+                }
+                if let Some(gather) = &gather {
+                    for (_, pass) in &gather.batches {
+                        pass.record(list);
+                    }
                 }
                 list.Close()
             })
@@ -6946,6 +6973,14 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_for(false)
+    }
+
+    pub(crate) fn prelude_budget(&self) -> Option<u64> {
+        self.budget_for(true)
+    }
+
+    fn budget_for(&self, prelude: bool) -> Option<u64> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -6955,8 +6990,12 @@ impl HostList {
             .as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
+        if prelude && deferred.budget_zeroed && !deferred.budget_in_prelude {
+            return None;
+        }
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
+            deferred.budget_in_prelude = prelude;
             let at = *data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
@@ -6978,8 +7017,8 @@ impl HostList {
             });
             deferred.copies.push(Step::Host(notes, (0, 0)));
             drop(deferred);
-            if let Some(card) = card {
-                self.zero_card_budget(card);
+            if !prelude && let Some(card) = card {
+                Self::zero_card_budget(&self.list, card);
             }
         }
         // SAFETY: a live buffer.
@@ -7001,8 +7040,8 @@ impl HostList {
     /// Records, before the list's first clamp, the zeroing of the card's
     /// copy of the budget: common, written as a copy, then left for
     /// unordered access until the list closes ([`HostList::card_budget_out`]).
-    fn zero_card_budget(&self, card: &ID3D12Resource) {
-        let Ok(list2) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+    fn zero_card_budget(list: &ID3D12GraphicsCommandList, card: &ID3D12Resource) {
+        let Ok(list2) = list.cast::<ID3D12GraphicsCommandList2>() else {
             return;
         };
         // SAFETY: a live buffer.
@@ -7014,13 +7053,13 @@ impl HostList {
         // SAFETY: an open list; the buffer is the list's own and in the
         // common state at the start of every recording.
         unsafe {
-            self.list.ResourceBarrier(&[transition(
+            list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
             list2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
-            self.list.ResourceBarrier(&[transition(
+            list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -7084,6 +7123,36 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// A possible writer or an in-list clamp ends prelude gathering.
+    pub(crate) fn gather_close(&self) {
+        if crate::indirect::gather_enabled() {
+            self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        }
+    }
+
+    pub(crate) fn gather_slot(
+        &self,
+        source: (u64, &ID3D12Resource),
+        recent: impl FnOnce() -> Vec<(u64, ID3D12Resource)>,
+        offset: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.closed {
+            return None;
+        }
+        if let Some((table, pass)) = gather.batches.last_mut()
+            && let Some(at) = table.place(source.0, offset, kind)
+        {
+            return Some((pass.dst.clone(), at));
+        }
+        self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref()?;
+        let (mut table, pass) = crate::indirect::prepare_batch(self, source, &recent(), true)?;
+        let record = table.place(source.0, offset, kind).map(|at| (pass.dst.clone(), at));
+        gather.batches.push((table, pass));
+        record
     }
 
     /// Where the next batch of clamped records goes: a device-local buffer

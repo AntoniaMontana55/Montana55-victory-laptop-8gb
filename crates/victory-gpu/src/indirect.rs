@@ -42,6 +42,18 @@ use crate::host::{HostList, host, transition};
 
 pub(crate) mod batch;
 
+pub(crate) fn gather_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // fxceless #1171: gather eligible indirect draws in the list's prelude.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn gather_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // fxceless #1171: gather draws into new in-list runs after a possible writer.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_RUNS").is_some_and(|v| v == "1"))
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -581,10 +593,37 @@ pub(crate) fn open_batch(
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
-    let c = batch_clamp()?;
-    let budget = list.budget()?;
-    let (jobs, at) = list.scratch(batch::TABLE)?;
-    let (dst, base, before) = list.batch_place()?;
+    let (table, pass) = prepare_batch(list, source, recent, false)?;
+    pass.record(&list.list);
+    Some((table, pass.dst))
+}
+
+pub(crate) struct BatchPass {
+    clamp: &'static Clamp,
+    pub(crate) dst: ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    budget: u64,
+    sources: [u64; batch::SOURCES],
+    jobs: u64,
+}
+
+impl BatchPass {
+    pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+        batch::record(self.clamp, list, (&self.dst, self.before), self.budget, self.sources, self.jobs);
+    }
+}
+
+/// Prepares the same batch pass for immediate recording or for the prelude.
+/// Its table stays writable until submission.
+pub(crate) fn prepare_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+    prelude: bool,
+) -> Option<(batch::Table, BatchPass)> {
+    let clamp = batch_clamp()?;
     let gpu = |b: &ID3D12Resource| {
         // SAFETY: a live buffer.
         Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
@@ -593,6 +632,9 @@ pub(crate) fn open_batch(
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
     ids[0] = source.0;
+    let budget = if prelude { list.prelude_budget()? } else { list.budget()? };
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
         if let Some(at) = gpu(buffer) {
@@ -602,12 +644,10 @@ pub(crate) fn open_batch(
             (ids[i + 1], sources[i + 1]) = (*id, at);
         }
     }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
-    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
+    let table = unsafe { batch::Table::new(at, base, ids) };
+    Some((table, BatchPass { clamp, dst, before, budget, sources, jobs }))
 }
 
 /// The batched clamp's root signature and pipeline on `device`, for the
@@ -2938,6 +2978,51 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
+    }
+
+    /// The prelude and an in-list pass use adjacent scratch slots and one
+    /// budget. The prelude table is filled before submission, including the
+    /// second record added after the first draw was recorded.
+    #[test]
+    fn host_list_gather_prelude_and_run_share_scratch() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let worker = compile_cs(&host.device, WORKER_CS).unwrap();
+        const DISPATCH: u32 = 2;
+        let signature = one_argument(&host.device, DISPATCH, 12);
+        let (source, data) = host.shared_buffer(256).unwrap();
+        let (hits, hits_data) = host.shared_buffer(256).unwrap();
+        let records = [3u32, 1, 1, 5, 1, 1, 7, 1, 1];
+        // SAFETY: both mappings hold 256 bytes and the list has yet to run.
+        unsafe {
+            data.cast::<[u32; 9]>().write(records);
+            hits_data.cast::<u32>().write(0);
+        }
+        let execute = |scratch: &ID3D12Resource, offset| {
+            // SAFETY: an open list and live worker state and buffers.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits.GetGPUVirtualAddress());
+                list.list.ExecuteIndirect(&signature, 1, scratch, offset, None, 0);
+            }
+        };
+        for _ in 0..2 {
+            let (scratch, offset) = list.gather_slot((1, &source), Vec::new, 0, DISPATCH).unwrap();
+            execute(&scratch, offset);
+            let (scratch, offset) = list.gather_slot((1, &source), Vec::new, 12, DISPATCH).unwrap();
+            execute(&scratch, offset);
+            let (mut run, scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+            execute(&scratch, run.place(1, 24, DISPATCH).unwrap());
+
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        }
+        // SAFETY: both submissions finished, and the results are mapped.
+        assert_eq!(unsafe { hits_data.cast::<u32>().read_volatile() }, 2 * (3 + 5 + 7));
     }
 
     /// A command signature of one argument of `kind` on `device`.

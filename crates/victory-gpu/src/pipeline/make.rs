@@ -118,6 +118,9 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            if made.is_none() {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -192,6 +195,14 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// Pipelines that could not be made (a shader that does not translate, or
+/// the driver's refusal), since the start.
+static FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn failed() -> u64 {
+    FAILED.load(Ordering::Relaxed)
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);

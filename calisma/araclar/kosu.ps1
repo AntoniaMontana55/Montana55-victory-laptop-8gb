@@ -33,6 +33,8 @@ $taban = [ordered]@{
     VICTORY_DYNAMIC_SLOTS      = '524288'
     # 26.11 RT paketi kabul (rtb: 184 -> 150 ms, goruntu ayni): BVH yapisi kurulmadan bosa calisan isin izleme isi kesilir.
     VICTORY_BVH_MISS           = '1'
+    # 26.11 12:35 Yigit: overlay her kosuda acik (F9 kapatir); A ve B'de ayni, olcumu bozmaz.
+    VICTORY_PANEL              = '1'
     VICTORY_RT_SKIP_RESOLVE    = '1'
     VICTORY_RT_SKIP_ACTIVATE   = '1'
     VICTORY_INDIRECT_BATCH     = '2'

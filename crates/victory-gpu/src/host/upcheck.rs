@@ -776,8 +776,8 @@ mod tests {
             slow.record(&b, 60);
             write(host, &b, &shadow, 1024, &result);
             b.close();
-            host.execute_own(&a);
-            host.execute_own(&b);
+            host.execute_own(&a, || {});
+            host.execute_own(&b, || {});
             settle_now(WHY_SYNC);
             wrong += usize::from(title[1024..1280] != result[..]);
             // The title writes beside it: the refresh takes the 64 KiB.
@@ -785,7 +785,7 @@ mod tests {
             let c = host.new_list().unwrap();
             shadow.refresh(&c, start as u64, LEN as u64);
             c.close();
-            host.execute_own(&c);
+            host.execute_own(&c, || {});
             settle_now(WHY_SYNC);
             let holds = card(host, &shadow);
             assert_eq!(holds[4096], round as u8 + 1, "the title's write is on the card");
@@ -816,7 +816,7 @@ mod tests {
         shadow.gpu_writes(&a, start as u64, 1 << 16);
         write(host, &a, &shadow, (5 << 16) + 512, &[0x77; 64]);
         a.close();
-        host.execute_own(&a);
+        host.execute_own(&a, || {});
         settle_now(WHY_SYNC);
         assert_eq!(card(host, &shadow)[(5 << 16) + 512], 0x77);
         assert!(title[(5 << 16) + 512] == 0, "it never comes back");
@@ -825,7 +825,7 @@ mod tests {
         let b = host.new_list().unwrap();
         shadow.refresh(&b, start as u64, LEN as u64);
         b.close();
-        host.execute_own(&b);
+        host.execute_own(&b, || {});
         settle_now(WHY_SYNC);
         let undone = card(host, &shadow)[(5 << 16) + 512] == 0;
         let stale = STALE.lock().unwrap_or_else(|e| e.into_inner());
@@ -857,7 +857,7 @@ mod tests {
             crate::picked::runs_in(&list);
             write(host, &list, &shadow, at, &[0x40 + round; 64]);
             list.close();
-            host.execute_own(&list);
+            host.execute_own(&list, || {});
             settle_now(WHY_SYNC);
             back.push(title[at..at + 64] == [0x40 + round; 64]);
             // The title's own write beside it is on the card, and the
@@ -865,7 +865,7 @@ mod tests {
             let next = host.new_list().unwrap();
             shadow.refresh(&next, start as u64, LEN as u64);
             next.close();
-            host.execute_own(&next);
+            host.execute_own(&next, || {});
             settle_now(WHY_SYNC);
             if *back.last().unwrap() {
                 let holds = card(host, &shadow);
@@ -897,7 +897,7 @@ mod tests {
         let all = host.new_list().unwrap();
         shadow.refresh(&all, start as u64, len as u64);
         all.close();
-        host.execute_own(&all);
+        host.execute_own(&all, || {});
         settle_now(WHY_SYNC);
         lists.push(all);
         let mut wrong = Vec::new();
@@ -908,7 +908,7 @@ mod tests {
             let busy = host.new_list().unwrap();
             slow.record(&busy, 40);
             busy.close();
-            host.execute_own(&busy);
+            host.execute_own(&busy, || {});
             lists.push(busy);
             for v in 0..3usize {
                 let list = host.new_list().unwrap();
@@ -919,7 +919,7 @@ mod tests {
                     list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, AT as u64, 256);
                 }
                 list.close();
-                host.execute_own(&list);
+                host.execute_own(&list, || {});
                 lists.push(list);
             }
             settle_now(WHY_SYNC);
@@ -1000,7 +1000,7 @@ mod tests {
             let all = host.new_list().unwrap();
             shadow.refresh(&all, *start as u64, ALL as u64);
             all.close();
-            host.execute_own(&all);
+            host.execute_own(&all, || {});
             lists.push(all);
         }
         settle_now(WHY_SYNC);
@@ -1060,7 +1060,7 @@ mod tests {
                     }
                 }
                 list.close();
-                host.execute_own(&list);
+                host.execute_own(&list, || {});
                 lists.push(list);
             }
             settle_now(WHY_SYNC);
@@ -1082,7 +1082,7 @@ mod tests {
                 read_out(&list, shadow, 0, ALL, (&out, (b * ALL) as u64));
             }
             list.close();
-            host.execute_own(&list);
+            host.execute_own(&list, || {});
             lists.push(list);
             settle_now(WHY_SYNC);
             for (b, model) in model.iter().enumerate() {
@@ -1136,7 +1136,7 @@ mod tests {
         let all = host.new_list().unwrap();
         shadow.refresh(&all, start as u64, LEN as u64);
         all.close();
-        host.execute_own(&all);
+        host.execute_own(&all, || {});
         settle_now(WHY_SYNC);
         title[0..64].fill(1);
         title[64..128].fill(2);
@@ -1169,7 +1169,7 @@ mod tests {
         // And zero for the next frame.
         assert!(list.place_copy(start + D + 128, start + 128, 64));
         list.close();
-        host.execute_own(&list);
+        host.execute_own(&list, || {});
         settle_now(WHY_SYNC);
         // SAFETY: the mapping; the copies into it have run.
         let read = unsafe { std::slice::from_raw_parts(out_data, 320) };
@@ -1261,19 +1261,19 @@ mod tests {
                 }
             }
             list.close();
-            host.execute_own(&list);
+            host.execute_own(&list, || {});
             lists.push(list);
             if round % 40 == 39 {
                 // Everything refreshed, landed and looked at.
                 let all = host.new_list().unwrap();
                 shadow.refresh(&all, start as u64, LEN as u64);
                 all.close();
-                host.execute_own(&all);
+                host.execute_own(&all, || {});
                 settle_now(WHY_SYNC);
                 let all = host.new_list().unwrap();
                 shadow.refresh(&all, start as u64, LEN as u64);
                 all.close();
-                host.execute_own(&all);
+                host.execute_own(&all, || {});
                 settle_now(WHY_SYNC);
                 lists.push(all);
                 assert_eq!(look(host), Some(0), "round {round}: the card's side is the CPU's side");

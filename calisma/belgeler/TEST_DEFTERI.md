@@ -24,6 +24,7 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 
 | Ne | Kaynak | Başkasında | Bizde | Neden bizde olmadı (kanıt / TAHMİN) |
 |---|---|---|---|---|
+| INDIRECT_GATHER=1 (fxceless #1171, Sol portu 50ac222) | fxceless #1171 | **3090 Ti: GPU listeleri 56 → 43-45 ms, kare 116 → 105 ms** | **182 → 204 ms (p90 335 → 2625), 151 → 371 ms** (ikinci çift n=4, kare satırları 172-182 ms) | Bizde clamp'ler zaten toplu (batch) çalışıyor, toplayacak ~1000 ayrı geçiş yok; prelude ek bekleme/takılma getirdi (TAHMİN). Düşen çizim sayısı tabanla aynı (271 + ~690), yani bozulma yok, sadece yavaş. 26.11 12:45 |
 | TEXTURE_DROP_MIPS=1 | fxceless #610 / soldsawn | soldsawn 4060L 8 GB: DROP_MIPS=2 ile 8-10 fps (A/B yok); #1022 5060L 16 GB RAM: 2-4 fps (A/B yok) | **153 → 168, 160 → 170 ms (+%6-10)** | VRAM'imiz taşmıyor (6.3/7.1 GB), yani kurtaracağı bir şey yok; ek kopya/eşleme işi kaldı (TAHMİN). Kimse temiz A/B yayınlamamış. |
 | DISPLAY_MODE=1280x720 | Neon önerisi | — | 177 → 229, 154 → 278 ms | Oyun modu yok sayıyor, düzlemler yine 1920x1080 / 3840x2160 (log kanıtı). Çözünürlük için tek yol RENDER_SCALE. |
 | KEEP_FREED=0 | Neon RAM taraması | — | 172 → 168, 159 → 175 ms | Fark gürültü içinde, RAM de düzelmedi. |

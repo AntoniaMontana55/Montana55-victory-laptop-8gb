@@ -4,7 +4,8 @@
 Gerçek: darboğaz EKRAN KARTI (%91-100). Yalnız kart işini azaltan şey fps'e yansır. Şu an hapishane ~150 ms (6.7 fps), RT paketi tabanda.
 Hız (sırayla):
 1. [RET 12:05] DROP_MIPS=1: 153->168, 160->170 ms (iki temiz çift, yavaşlattı; kart 6.3/7.1 GB, VRAM taşmıyor). DROP_MIPS=2 de düştü.
-1a. [Sol portluyor] fxceless #1171 indirect gruplama (3090 Ti: GPU 56->43 ms) — opt-in, Sol taraması 12:00'nin 1 numarası.
+1a. [RET 12:45] #1171 INDIRECT_GATHER=1: 182→204, 151→371 ms (p90 2625 takılma). Kod kalır (varsayılan kapalı). NOT: tabanda da "dropped 271 without a host pipeline + ~690 indirect" var (RT atlama paketi mi? — 09:25 D1'de indirect 0'dı; incele).
+1a2. [koşuyor 12:47] SEND_BAR=1 (sba/sbb). Sol paralelde CLAMP_WAITS=0 portluyor (derlemeyi koşu bitince yapacak).
 1b. fxceless #1227 CARD_SYNC_BATCH (send+hash kartta 29->6 ms; 6aed0780) — #1171'den sonra.
 1d. scarlett CLAMP_WAITS=0 (~30 satır; clamp başına 2 tam bekleme; Trexies ~30-50 ms kart) — #1171 ile aynı dosya, ondan sonra.
 1e. odycal VRAM_WINDOW=1 (~500-700 satır): pencereler VRAM'e; kart sistem RAM'inden okumayı bırakır (TAHMİN). #413'ün tersine taşmada kendini kapatıyor.
@@ -17,7 +18,7 @@ Hız (sırayla):
 6. CARD_REHASH_GAP (ad3lre b6552d5e, +33) — küçük.
 7. GPU_UPLOAD (Marvisak #3102, +5425, yüksek risk) — en son.
 Hız dışı:
-8. [yazıldı, derlenmedi] Oyun içi overlay: mevcut host/panel.rs genişletildi — F9 (F3 de) her zaman aç/kapa, renkli FPS satırı, CPU çekirdek, SHADERS/NEW, PIPELINES/WAITING/FAILED (make.rs FAILED sayacı), son 120 karenin çubuk grafiği (30/10 fps çizgileri). Release'de de var. Sol #1171 bitince birlikte derlenip testler + ekran görüntüsü.
+8. [BİTTİ 12:30, 50ac222] Overlay: F9/F3 her zaman, renkli FPS, CPU çekirdek, SHADERS/NEW, PIPELINES/WAITING/FAILED, 120 kare grafik; panel testleri 6/6. 12:35 Yiğit isteği: kosu.ps1 tabanında VICTORY_PANEL=1 (gab çiftinden itibaren; gaa çifti panelsiz — çift içi tutarlı).
 9. cool_fox görüntü düzeltmeleri (etiket coolfox-f4b48ad): resource.rs lanes.guards Wave32 göz/şeffaflık siyah kare (~25), d16+SLOT_TABLE_STRIDES yüz bozulması (~300), XMA ses (~24), BufferSweep RAM sızıntısı (~60), release_tables (~25), pool 500 ms back-off (~20).
 10. Vertex: SKIP_WC_COMPARE/SHARED (geri kopya 85→9 MB), GUARDS RwLock + ASK_ONCE_VIEWS, MAPPING_RANGES, REFRESH_STAMP, merge_piece 64B — CPU tarafı (kart darboğazında fps'e az yansır), sonra.
 11. Pho/Trident lazy copy-back (kaynağı açık mı bilinmiyor).

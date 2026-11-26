@@ -2720,7 +2720,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        self.buffers_written();
+        self.buffers_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -3067,7 +3067,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3557,7 +3557,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3662,7 +3662,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3676,23 +3676,26 @@ impl State {
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
-    fn buffers_written(&mut self) {
+    fn buffers_written(&mut self, list: &HostList) {
+        list.gather_close();
         match &mut self.batch {
-            Some(batch) if batches() == 2 => batch.wrote = true,
+            Some(batch) if batches() == 2 && !crate::indirect::gather_enabled() => batch.wrote = true,
             batch => *batch = None,
         }
     }
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            list.gather_close();
             self.batch = None;
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
-    pub(crate) fn copied(&mut self) {
+    pub(crate) fn copied(&mut self, list: &HostList) {
+        list.gather_close();
         self.window = None;
         self.batch = None;
     }
@@ -3830,13 +3833,41 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let offset = args.offset(arguments);
+        let gather = crate::indirect::gather_enabled();
+        let gatherable = gather && kind != DISPATCH && max == 1 && count.is_none()
+            && !p.stages.iter().any(|stage| stage.translated().stores)
+            && stride.is_multiple_of(4)
+            && crate::indirect::batch::words(kind).is_some_and(|words| {
+                let bytes = words * 4;
+                stride >= bytes && offset.is_multiple_of(4)
+                    && offset <= u64::from(u32::MAX - bytes)
+            });
+        let gathered = if gatherable {
             args.refresh(list, arguments, len);
+            list.gather_slot((args.id(), &args.buffer), || argument_copies(&args), offset, kind)
+        } else {
+            None
+        };
+        if gather && gathered.is_none() {
+            list.gather_close();
+        }
+        // One record without a count: clamped in a batch (`batches`).
+        let batch = if gathered.is_some() {
+            gathered
+        } else if (if gatherable { crate::indirect::gather_runs() } else { batches() > 0 })
+            && max == 1 && count.is_none()
+        {
+            if !gatherable {
+                args.refresh(list, arguments, len);
+            }
             self.batched(list, &args, arguments, kind)
         } else {
             None
         };
+        if gather && (!gatherable || batch.is_none()) {
+            self.batch = None;
+        }
         if batch.is_some() {
             self.window = None;
         }
@@ -3845,7 +3876,6 @@ impl State {
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
-        let offset = args.offset(arguments);
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -3956,9 +3986,9 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written();
+            self.buffers_written(list);
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it

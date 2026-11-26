@@ -462,6 +462,14 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines made or loaded from the library, and those the driver
+/// refused, since the start (the panel).
+#[cfg(windows)]
+pub(crate) fn made_and_failed() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed) + library::LOADED.load(Relaxed), make::failed())
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

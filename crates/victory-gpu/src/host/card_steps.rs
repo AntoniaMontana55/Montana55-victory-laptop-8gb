@@ -1264,7 +1264,7 @@ mod tests {
                     .ResourceBarrier(&[transition(&first.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
             }
             a.close();
-            host.execute_own(&a);
+            host.execute_own(&a, || {});
             // With the flight in the air, beside what it writes.
             for (i, b) in title[5300..5400].iter_mut().enumerate() {
                 *b = seed(1300 + i) ^ 0x5c;
@@ -1285,12 +1285,12 @@ mod tests {
             b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
-            host.execute_own(&b);
+            host.execute_own(&b, || {});
             // What the first wrote, read by the next submission.
             let c = host.new_list().unwrap();
             c.defer_copy((start + 1_200_000) as *mut u8, (start + HALF + 100) as *const u8, 1500);
             c.close();
-            let number = host.execute_own(&c);
+            let number = host.execute_own(&c, || {});
             settle_now(WHY_SYNC);
             assert!(FINISHED.load(Ordering::Acquire) >= number);
             let wanted: Vec<u8> = (0..2000)
