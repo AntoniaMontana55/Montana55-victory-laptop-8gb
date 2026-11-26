@@ -1351,6 +1351,13 @@ fn raw_twins() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a list's views get a raw twin made even for a heap that keeps
+/// none, as before 26.11 (`VICTORY_LIST_TWINS=1`; to measure against).
+fn list_twins_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_TWINS").is_some_and(|v| v == "1"))
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -2573,15 +2580,24 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            // A raw twin is made only for a heap that keeps twins: a host
+            // without them (NVIDIA, its views capped at a million) made one
+            // for every buffer view and threw it away, 10-12 thousand
+            // views a frame (prison cell, 26.11). One made without a twin
+            // is made again, in its place, for a heap that keeps them.
+            let without_twin = views
+                .made
+                .get(&words)
+                .is_some_and(|m| twins && !m.twin && twinned(&m.view) && !list_twins_always());
+            if without_twin || !views.made.contains_key(&words) {
                 let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
+                let at = views.made.get(&words).map_or(2 * views.made.len() as u32, |m| m.at);
                 // (A constant buffer's bytes are copied for each draw.)
                 if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let twin = twinned(&view) && (twins || list_twins_always());
+                let kept = make_twinned(&view, views.slot(at), twin.then(|| views.slot(at + 1)))?;
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
