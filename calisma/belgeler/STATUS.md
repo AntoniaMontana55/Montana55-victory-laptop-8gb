@@ -1,5 +1,27 @@
 # STATUS — victory-fork katkısı
 
+## TEST LİSTESİ — UNUTMA (Yiğit 26.11 12:02 "bunları unutma"; her adım bitince güncelle)
+Gerçek: darboğaz EKRAN KARTI (%91-100). Yalnız kart işini azaltan şey fps'e yansır. Şu an hapishane ~150 ms (6.7 fps), RT paketi tabanda.
+Hız (sırayla):
+1. [RET 12:05] DROP_MIPS=1: 153->168, 160->170 ms (iki temiz çift, yavaşlattı; kart 6.3/7.1 GB, VRAM taşmıyor). DROP_MIPS=2 de düştü.
+1a. [Sol portluyor] fxceless #1171 indirect gruplama (3090 Ti: GPU 56->43 ms) — opt-in, Sol taraması 12:00'nin 1 numarası.
+1b. fxceless #1227 CARD_SYNC_BATCH (send+hash kartta 29->6 ms; 6aed0780) — #1171'den sonra.
+1c. Ölçüm serisi öncesi `victory shaders` + `warm --used` tazele (BVH_MISS/RT anahtarları değişti; Discord bdoe "pre warm" tarifi). Fps'i değil takılma/dünyaya giriş süresini düzeltir (03:50 warm kanıtı).
+2. SEND_BAR=1 (kodsuz, send.rs:137).
+3. ~~DROP_MIPS=2~~ (1 reddedildi).
+4. GPU_TIMING=1 teşhis: her karedeki 43-48 ms'lik submission'ın içinde ne var (host.rs:1790); Neptune 6cc42d53 VICTORY_GPU_TIME (+409) alternatif.
+5. RENDER SCALE 480p/540p/720p (trustno1 afd84de1 VICTORY_RENDER_SCALE + OWN_UPSCALER, +277, exe bellek yaması; "Flamed Culprit" launcher'daki 480p-2160p seçeneği bu). En büyük kazanç, en riskli → ucuzlar bitince.
+6. CARD_REHASH_GAP (ad3lre b6552d5e, +33) — küçük.
+7. GPU_UPLOAD (Marvisak #3102, +5425, yüksek risk) — en son.
+Hız dışı:
+8. [yazıldı, derlenmedi] Oyun içi overlay: mevcut host/panel.rs genişletildi — F9 (F3 de) her zaman aç/kapa, renkli FPS satırı, CPU çekirdek, SHADERS/NEW, PIPELINES/WAITING/FAILED (make.rs FAILED sayacı), son 120 karenin çubuk grafiği (30/10 fps çizgileri). Release'de de var. Sol #1171 bitince birlikte derlenip testler + ekran görüntüsü.
+9. cool_fox görüntü düzeltmeleri (etiket coolfox-f4b48ad): resource.rs lanes.guards Wave32 göz/şeffaflık siyah kare (~25), d16+SLOT_TABLE_STRIDES yüz bozulması (~300), XMA ses (~24), BufferSweep RAM sızıntısı (~60), release_tables (~25), pool 500 ms back-off (~20).
+10. Vertex: SKIP_WC_COMPARE/SHARED (geri kopya 85→9 MB), GUARDS RwLock + ASK_ONCE_VIEWS, MAPPING_RANGES, REFRESH_STAMP, merge_piece 64B — CPU tarafı (kart darboğazında fps'e az yansır), sonra.
+11. Pho/Trident lazy copy-back (kaynağı açık mı bilinmiyor).
+Park (eski): JOIN_PARTS=2 görüntü korur mu; T2 ListViews kayıtlar arası cache; LAZY_COPYBACK (fxceless #1178); write marks (Marvisak); PAGE_MIRROR (timibloozinger); Neptune siyah ekran sebebi.
+Bekleyen raporlar (12:15): Neon victory-scarlett 2. deneme (ilki 2 saat takıldı, iptal), Neon Z-rox/mandyhub, Neon K0NL/odycal, Sol #1171 portu. Sol genel tarama GELDİ 12:00 (#1171, #1227, #648, klbf DXIL, xmem SECTION_MB).
+Topluluk: BlatWolf (Win10, 4060) — Agility ile çalıştı, GPU %100; TDR için TdrDelay=10 önerildi.
+
 ## Hedef + sıradaki adımlar
 26.11 11:50 ✓ RT PAKETİ KABUL (BVH_MISS=1 + RT_SKIP_RESOLVE=1 + RT_SKIP_ACTIVATE=1, kosu.ps1 tabanına): temiz çift rtb taban 184.0 → rt 150.2 ms (−%18), kirli çift rta (Sol derlemesi CPU 6 çekirdek) taban 698.8 (bozuk) / rt 155.9; görüntü aynı (kare_0394s vs kare_0194s). BVH_MISS tek başına: 176/162 vs 208 ms (bir taban bozuk, kesin değil). NOT: kosu tabanındaki VICTORY_RT_RESOLVE=0 bizim kodda HİÇ okunmuyordu (ölü env). Kod: 90d3c4f (Win10 Agility + BVH_MISS), 12bfc26 (RT skip, cool_fox 8cc31ab3 opt-in + "d3d12 sdk" açılış satırı), 8efaaf8 (TEXTURE_DROP_MIPS, fxceless #610, Sol portu, Claude diff inceledi). cool_fox: f4b48ad kaynaktan derlendi (Neon+Claude güvenlik TEMİZ, repo sonra silindi → etiket coolfox-f4b48ad); kendi ayarlarıyla bizde 383-460 ms (2.5x yavaş); siyah ekranın sebebi compose.rs premultiplied alfa (düz alfa ile görüntü geliyor). Win10 (BlatWolf, 4060): Agility düzeltmesiyle açıldı; o da GPU %100. Sol taraması: en güçlü aday DROP_MIPS (4060 Ti 8 GB: GPU 226-247 → 82-89 ms). Koşuyor: dmp serisi taban(RT dahil) / DROP_MIPS=1 ×2.
 26.11 10:10 ✗ DISPLAY_MODE=1280x720 RET: oyun moda uymuyor (düzlemler yine [1920x1080][3840x2160]); dma 177.5→229 ms, dmb 154.3→277.5 ms (daha kötü, n=3/5). Çözünürlük düşürmenin yolu yalnız RENDER_SCALE (trustno1 afd84de1, +277, exe yaması). Neon GPU taraması: kodsuz SEND_BAR=1 (~5 ms GPU, 7900XTX kanıtlı), CARD_STEPS=0 (8800 fill'i karttan al), GPU_TIMING=1 (yavaş listeler), WAVE_LOCAL=1 (teşhis, riskli); kod: BVH_MISS (+21, trustno1 RTX 5070 ~10 ms GPU), RENDER_SCALE. Neon'un "DISPLAY_MODE=1920x1080 yap" önerisi yanlış (zaten ayarlı; 4K swap chain UI düzleminden). BVH_MISS PORTLANDI (Claude): intersect.rs bvh_miss() + boxes/triangle dalları, shader_cache.rs anahtar listesine VICTORY_BVH_MISS; diag build OK (yalnız eski uyarılar). Koşuyor: bv serisi taban / BVH_MISS=1 ×2 (ilk koşular shader önbelleğini yeniden doldurur).
