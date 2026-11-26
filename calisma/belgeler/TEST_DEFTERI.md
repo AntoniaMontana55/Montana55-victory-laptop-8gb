@@ -44,6 +44,14 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 | WIDE_REFRESH=1 | fxceless | — | fark yok | Kapalı. |
 | cool_fox derlemesinin tamamı | codec-d/cool_fox | "çok hızlı" iddiası, ölçüm yok | **~2.5 kat yavaş + siyah ekran** | Siyah ekran: premultiplied alfa varsayımı (bizimki düz alfa). Repo silindi; iyi parçaları tek tek alınıyor. |
 
+
+## Teşhis ölçümleri (kabul/ret değil, nereye bakacağımızı gösterir)
+
+| Ne | Bizde | Anlamı |
+|---|---|---|
+| GPU_TIMING=1 + DRED (gt-teshis, 26.11 13:05) | tek komut baskın: indirect compute **3592426e3e9142d8 = ProbeGather** (ışık probu ışın toplama, XTP shader-roles), tek başına 32.5 / 42.5 ms | Başkasında: 4060 Ti 8 GB ort 9 ms, en kötü 40.7 ms (fxceless #10). Büyük listelerdeki "doku yükleme 8-30 ms" ölçüm hatası: liste başına 4096 damga, kalan komutlar sonuncuya yazılıyor (host.rs STAMPS). |
+| SKIP_PIPELINES=3592426e3e9142d8 (tavan ölçümü) | temiz çift skc: **149.9 → 134.6 ms (−%10)**, p90 587 → 150 (takılmalar kayboldu); diğer çiftler 145/146 (tabanları kirli) | Kazanç tavanı ~15 ms + takılmalar. **Görüntü bozuluyor** (duvar posterlerinde renkli bozuk kareler) → atlamak çözüm değil; shader'ın kendisi hızlanmalı (LOOP_LIMIT testi). |
+
 ## Belirsiz / tekrar gerek
 
 | Ne | Bizde | Not |
