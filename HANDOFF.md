@@ -81,6 +81,18 @@ python profil_oku.py <birleşik profil> --kisa [--ara shadow::lookup] [--thread 
 
 Her yabancı commit için önce güvenlik incelemesi (`calisma/raporlar/guvenlik_*.md` örnekleri), sonra tek değişkenle 2 koşu.
 
+## Güçlü sistemde (12–16 GB VRAM, 32+ GB RAM) denenecekler
+
+Bizim 8 GB / 16 GB makinede bellek yüzünden deneyemediklerimiz. Her biri ayrı koşu, tek değişken; önce bizim ayar setiyle (`kosu.ps1 -Tag taban`) kendi taban ölçümünü al.
+
+1. **Series X profili** (`--console series-x`, 4K iç çözünürlük): bizde RAM yetmedi. Taban ile fps/görüntü farkı.
+2. **Neptune ayar seti** (README'de 6.500 draw / ~90 ms açık dünya; RTX 5070 Ti'de 20+ fps): `INDIRECT_RAW=3`, `CLAMP_AFTER_WRITER=1`, `CLAMP_BATCH=1`, `LEVELS_ON_DEMAND=1`, `DROP_DXIL=1`, `DESC_DATA=1`, `PIPELINE_WAIT_MS=2500`, `TEXTURE_HASH_EVERY=32` ve 32 GB için `LIST_POOL_MB=512`, `LIST_POOL_MOST=1024`, `TEXTURE_STAGE_MB=256`, `CARD_WINDOWS_MB=3072`. Bunların bir kısmı yalnız Neptune kodunda var (`calisma/raporlar/neptune_traffic_inceleme.md` §2.2); bizim ağaçta olmayanlar sessizce yok sayılır — run.log'da hangilerinin tanındığına bak.
+3. **Yerinde (kopyasız) pencereler** `VICTORY_INPLACE=1` + `INPLACE_MB=4096`: 16 GB'ta cihaz sıfırlandı; bol RAM'de sonuç farklı olabilir.
+4. **Kart tamponları** `VICTORY_CARD_BUFFERS_MIN_MB=1` + `CARD_BUFFERS_MB=1024` (trustno1 önerisi) ve `WINDOWS_BAR_MB=4096`.
+5. **trustno1 hız seti** (`a9632bc8` DYNAMIC_SLOTS=524288, `24a479d3` BVH_MISS=1, `afd84de1` RENDER_SCALE=0.5 + OWN_UPSCALER=1): kod portu gerektirir; Smooth Motion (sürücü ara karesi) **kapalı** ölçülmeli, yoksa fps ikiye katlanmış görünür.
+
+**Bize ne lazım (her koşu için):** donanım (CPU, GPU+VRAM, RAM, sürücü), profil (S/X), çözünürlük, `-Ek` ayarları, `kisa_ozet.ps1` satırı (ilk dünya sn, dünya medyan/p90 ms, ~200. sn bellek), bir ekran görüntüsü, çöktüyse run.log'un son 100 satırı. Bunları issue olarak açabilir ya da `calisma/belgeler/KOSULAR.md` biçiminde gönderebilirsin.
+
 ## Takip ettiğimiz repolar
 
 Ayrıntı ve commit bazında değerlendirme: `calisma/raporlar/HASAT_MATRISI.md` (bizde var/yok, 8/16 GB değeri, risk), `calisma/belgeler/ADAYLAR.md`, `calisma/raporlar/watcher.md`.
