@@ -892,6 +892,16 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    // (Local) Every tenth time: who holds the memory, from the book
+    // (`VICTORY_BOOK=1` with device-removed data on).
+    {
+        static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if TIMES.fetch_add(1, Relaxed) % 10 == 0 {
+            for line in crate::book::owners(24) {
+                tracing::info!("{line}");
+            }
+        }
+    }
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.

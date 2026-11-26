@@ -2214,6 +2214,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Source allocations held by a composed Present until its list resets.
+    present_planes: Vec<std::sync::Arc<crate::resource::HostTexture>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3629,6 +3631,8 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+mod present_planes;
+pub(crate) use present_planes::PresentPlane;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -5161,9 +5165,9 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
-    fn execute_own(&self, list: &HostList) -> u64 {
+    fn execute_own(&self, list: &HostList, record: impl FnOnce()) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        let Some((submitted, sent)) = self.submit_recording(&[list], &[], true, record) else {
             return 0;
         };
         let number = sent.number;
@@ -5397,6 +5401,18 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        self.submit_recording(runs, parts, late, || {})
+    }
+
+    /// Composed Present records its barriers under the submission lock,
+    /// using the resource states left by earlier submissions.
+    fn submit_recording<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        record: impl FnOnce(),
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5405,6 +5421,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        record();
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -8810,7 +8827,41 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        self.present_frame(
+            texture,
+            D3D12_RESOURCE_STATES(state as i32),
+            (desc.Width as u32, desc.Height),
+            format,
+            frame,
+            None,
+        )
+    }
+
+    pub(crate) fn present_planes(&self, planes: &[PresentPlane], premultiplied: bool, frame: u64) -> Option<bool> {
+        let Some(composition) = present_planes::Composition::new(&self.device, planes, premultiplied) else {
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| tracing::warn!("present planes cannot be composed"));
+            return None;
+        };
+        self.present_frame(
+            &planes[0].texture.texture,
+            D3D12_RESOURCE_STATE_PRESENT,
+            composition.size,
+            composition.format,
+            frame,
+            Some(&composition),
+        )
+    }
+
+    fn present_frame(
+        &self,
+        texture: &ID3D12Resource,
+        state: D3D12_RESOURCE_STATES,
+        (width, height): (u32, u32),
+        format: DXGI_FORMAT,
+        frame: u64,
+        composition: Option<&present_planes::Composition<'_>>,
+    ) -> Option<bool> {
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8848,7 +8899,6 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -8879,44 +8929,72 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
-            #[cfg(feature = "diagnostics")]
-            let watched = crate::popwatch::take(&self.device, list, texture);
-            #[cfg(feature = "diagnostics")]
-            p.panel.draw(self, copy, &back, (width, height), format);
+            let (mut capture, mut probe, mut watched) = (None, None, None);
+            let record = || {
+                if let Some(composition) = composition {
+                    composition.record(self, copy, &back);
+                } else {
+                    list.ResourceBarrier(&[
+                        transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                    ]);
+                    list.CopyResource(&back, texture);
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let image = if composition.is_some() {
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        &back
+                    } else {
+                        texture
+                    };
+                    capture = crate::capture::wanted(frame)
+                        .then(|| crate::capture::read_back(&self.device, list, image))
+                        .flatten();
+                    probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, image) };
+                    watched = crate::popwatch::take(&self.device, list, image);
+                    if composition.is_some() {
+                        list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    }
+                    p.panel.draw(self, copy, &back, (width, height), format);
+                }
+                let ready = transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+                if composition.is_some() {
+                    list.ResourceBarrier(&[ready]);
+                } else {
+                    list.ResourceBarrier(&[
+                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                        ready,
+                    ]);
+                }
+                copy.close();
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
-            copy.close();
+            let record = if composition.is_some() {
+                Some(record)
+            } else {
+                // A one-plane copy is recorded before submission as before.
+                ({ record })();
+                None
+            };
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = match record {
+                        Some(record) => self.execute_own(copy, record),
+                        None => self.execute_own(copy, || {}),
+                    };
                     p.ahead[i].1 = flown;
                     flown
                 }
                 None => {
-                    self.execute(&[copy]);
+                    if let Some(record) = record {
+                        crate::queue::before_sync();
+                        let _ = self.submit_recording(&[copy], &[], false, record);
+                    } else {
+                        self.execute(&[copy]);
+                    }
                     0
                 }
             };
@@ -8931,7 +9009,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             #[cfg(feature = "diagnostics")]
-            crate::replay::record::present(texture, state);
+            crate::replay::record::present(if composition.is_some() { &back } else { texture }, state);
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");

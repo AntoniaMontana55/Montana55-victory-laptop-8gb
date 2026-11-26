@@ -119,8 +119,19 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
+/// (Local) `VICTORY_SEND_KEPT_MB` sets it (16 to 1024): upload memory is
+/// the PC's, locked while it stands (run b11: 21 of them alive, 464 MB, of
+/// a 3.7 GB lock on a 16 GB PC).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    static MB: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *MB.get_or_init(|| {
+        std::env::var("VICTORY_SEND_KEPT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| (16..=1024).contains(mb))
+    });
+    match asked {
+        Some(mb) => mb << 20,
+        None if on_card() => 256 << 20,
+        None => 768 << 20,
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

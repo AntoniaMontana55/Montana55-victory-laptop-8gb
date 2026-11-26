@@ -1115,25 +1115,56 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     }
 }
 
+/// Bytes of `[at, at + len)` the title's views show (the rest are holes:
+/// no page of the title is there). Views do not overlap.
+fn mapped_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> usize {
+    let end = at.saturating_add(len);
+    let mut n = 0;
+    for (&base, &(bytes, _, _)) in views.range(..end).rev() {
+        let reach = base.saturating_add(bytes);
+        if reach <= at {
+            break;
+        }
+        n += reach.min(end) - base.max(at);
+    }
+    n
+}
+
 /// The census lines for `spans` (start, bytes, whether a window outside
 /// buffers).
 fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
     let mut known = Vec::new();
     let (mut buffers, mut windows) = (Tally::default(), Tally::default());
+    // (Local) Of the copies over holes: the bytes the views show, and how
+    // many copies hold no mapped page at all.
+    let (mut hole_mapped, mut hole_empty) = ([0u64; 2], [0u64; 2]);
     for &(start, len, window) in spans {
         let kind = kind_of(start as usize, len as usize, &mut known);
         let tally = if window { &mut windows } else { &mut buffers };
         tally.0[kind].0 += 1;
         tally.0[kind].1 += len;
+        if kind == 3 {
+            let mapped = mapped_in(&views().views, start as usize, len as usize) as u64;
+            hole_mapped[usize::from(window)] += mapped;
+            hole_empty[usize::from(window)] += u64::from(mapped == 0);
+        }
     }
     let mut lines = Vec::new();
-    for (name, tally) in [("title buffers", buffers), ("windows outside buffers", windows)] {
+    for (i, (name, tally)) in [("title buffers", buffers), ("windows outside buffers", windows)].into_iter().enumerate() {
         let all = tally.0.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         lines.push(format!("census, {name}: {} of {} MB", all.0, all.1 >> 20));
         for (kind, &(n, bytes)) in KINDS.iter().zip(&tally.0) {
             if n > 0 {
                 lines.push(format!("census,   {kind}: {n} of {} MB", bytes >> 20));
             }
+        }
+        if tally.0[3].0 > 0 {
+            lines.push(format!(
+                "census,     of those with unmapped pages: {} MB mapped, {} MB holes; {} hold no mapped page",
+                hole_mapped[i] >> 20,
+                (tally.0[3].1.saturating_sub(hole_mapped[i])) >> 20,
+                hole_empty[i]
+            ));
         }
     }
     let v = views();

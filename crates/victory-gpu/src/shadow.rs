@@ -493,6 +493,24 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The share of the card's budget in use (percent) under which a new window
+/// still goes to card memory the CPU maps ([`window_mapped_for`]):
+/// `VICTORY_WINDOWS_BAR_PERCENT`, 50 to 88, else 80 (as before). Local
+/// (26.11): on an 8 GB card textures and targets already hold more than
+/// 80 %, so every later window fell back to a locked shared buffer in the
+/// PC's memory; above 88 the texture queue (which stops at 90 %) would
+/// starve.
+fn window_mapped_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| (50..=88).contains(p))
+            .unwrap_or(80)
+    })
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -502,7 +520,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_mapped_percent()
     {
         return None;
     }

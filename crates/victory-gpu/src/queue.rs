@@ -651,6 +651,65 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
+/// The observed Series S layout extends the single-plane prefix.
+#[cfg(windows)]
+#[repr(C)]
+struct PlaneDescription {
+    prefix: Plane,
+    src: *const [i32; 4],
+    dest: *const [f32; 4],
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    extended: *const u8,
+    flags: u32,
+}
+
+#[cfg(windows)]
+const _: () = assert!(std::mem::size_of::<PlaneDescription>() == 72);
+
+#[cfg(windows)]
+fn present_planes(count: u32, parameters: *const Plane) -> Option<(Vec<crate::host::PresentPlane>, bool)> {
+    use crate::host::PresentPlane;
+    if count < 2 || parameters.is_null() {
+        return None;
+    }
+    static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (enabled, premultiplied) = *MODE.get_or_init(|| match std::env::var("VICTORY_PRESENT_PLANES").as_deref() {
+        Ok("0") => (false, false),
+        Ok("premul") => (true, true),
+        _ => (true, false),
+    });
+    if !enabled {
+        return None;
+    }
+    // SAFETY: a multi-plane Present passes count descriptions in the
+    // Series S ABI. Their lists and optional rectangles live through this call.
+    let descriptions = unsafe {
+        std::slice::from_raw_parts(parameters.cast::<PlaneDescription>(), count as usize)
+    };
+    let token = descriptions[0].prefix.token;
+    let mut planes = Vec::with_capacity(descriptions.len());
+    for d in descriptions {
+        if d.prefix.token != token || !(1..=8).contains(&d.prefix.count) || d.prefix.resources.is_null() {
+            return None;
+        }
+        // SAFETY: the checked prefix describes a nonempty resource array.
+        let resource = unsafe { d.prefix.resources.read_unaligned() };
+        let texture = crate::resource::host_copy(resource)?;
+        // SAFETY: optional rectangle pointers belong to this description.
+        let (src, dest) = unsafe {
+            (
+                (!d.src.is_null()).then(|| d.src.read_unaligned()),
+                (!d.dest.is_null()).then(|| d.dest.read_unaligned()),
+            )
+        };
+        planes.push(PresentPlane { resource: resource as usize, texture, src, dest });
+    }
+    Some((planes, premultiplied))
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -850,7 +909,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the title's planes in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -925,6 +984,19 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    if let Some((planes, premultiplied)) = present_planes(planes, plane_parameters) {
+        let shown = Shown { frame, resource: planes[0].resource };
+        if behind::on() && !this.is_null() {
+            behind::present(this, behind::Present::Planes(planes, premultiplied), shown);
+        } else {
+            show_planes(&planes, premultiplied, shown);
+        }
+        called.end();
+        #[cfg(feature = "diagnostics")]
+        frame_ends();
+        return S_OK;
+    }
+    #[cfg(windows)]
     if behind::on() && !this.is_null() {
         const COPY_SOURCE: u32 = 0x800;
         let texture = if planes > 0
@@ -949,7 +1021,7 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        behind::present(this, behind::Present::Copy(texture.map(|(_, copy, state)| (copy, state))), Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -1010,6 +1082,18 @@ fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u
     let shown = host.present(texture, state, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, what.resource);
+}
+
+#[cfg(windows)]
+fn show_planes(planes: &[crate::host::PresentPlane], premultiplied: bool, what: Shown) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let shown = host.present_planes(planes, premultiplied, what.frame);
+    #[cfg(feature = "diagnostics")]
+    blinks(what.frame, what.resource as This, planes[0].texture.state.load(Ordering::Relaxed), shown);
     #[cfg(not(feature = "diagnostics"))]
     let _ = (shown, what.resource);
 }
