@@ -5,7 +5,14 @@ Gerçek: darboğaz EKRAN KARTI (%91-100). Yalnız kart işini azaltan şey fps'e
 Hız (sırayla):
 1. [RET 12:05] DROP_MIPS=1: 153->168, 160->170 ms (iki temiz çift, yavaşlattı; kart 6.3/7.1 GB, VRAM taşmıyor). DROP_MIPS=2 de düştü.
 1a. [RET 12:45] #1171 INDIRECT_GATHER=1: 182→204, 151→371 ms (p90 2625 takılma). Kod kalır (varsayılan kapalı). NOT: tabanda da "dropped 271 without a host pipeline + ~690 indirect" var (RT atlama paketi mi? — 09:25 D1'de indirect 0'dı; incele).
-1a2. [koşuyor 12:47] SEND_BAR=1 (sba/sbb). Sol paralelde CLAMP_WAITS=0 portluyor (derlemeyi koşu bitince yapacak).
+1a2. [RET 13:00] SEND_BAR=1: 152→180 ms (temiz çift); hazırlık 95→145-160 ms (CPU kart belleğine bus üzerinden yazıyor). Sol CLAMP_WAITS=0 portu sürüyor.
+YENİ SIRA (Neon GPU araştırması 12:55, veriyle):
+G0. [sırada, SEND_BAR bitince otomatik] GPU_TIMING=1 + D3D12_DRED=1 teşhis koşusu (gt-teshis): 43-48 ms'lik listeyi yapan shader hash'i. #1278 (4050L) 7 compute ~125 ms/kare buldu (8cbd7f5b ~30 ms). Scarlett (4080S): 24 MB kart kopyası kaybolunca tek compute listesi 1 → 42-72 ms (sistem RAM'den PCIe okuma) — bizim 43-48 ms aynı mekanizma olabilir (TAHMİN).
+G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
+G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
+G3. HOIST_CLAMPS / CLAMP_AFTER_WRITER (fxceless #1184 kontrollü A/B 5070 Ti: kart 127 → 107 ms; Neptune 09222fa7 4.6 → 8.4 fps).
+G4. VIDEO_BUDGET_MB (#1184: VRAM taşınca 982f 160 → 12 ms) — G0 sistem RAM düşüşü gösterirse öne.
+Ölçüm aracı (sürekli): Neptune 6cc42d53 VICTORY_GPU_TIME (+409) ya da scarlett cardmeter.rs — G0 yetmezse port.
 1b. fxceless #1227 CARD_SYNC_BATCH (send+hash kartta 29->6 ms; 6aed0780) — #1171'den sonra.
 1d. scarlett CLAMP_WAITS=0 (~30 satır; clamp başına 2 tam bekleme; Trexies ~30-50 ms kart) — #1171 ile aynı dosya, ondan sonra.
 1e. odycal VRAM_WINDOW=1 (~500-700 satır): pencereler VRAM'e; kart sistem RAM'inden okumayı bırakır (TAHMİN). #413'ün tersine taşmada kendini kapatıyor.
@@ -23,7 +30,7 @@ Hız dışı:
 10. Vertex: SKIP_WC_COMPARE/SHARED (geri kopya 85→9 MB), GUARDS RwLock + ASK_ONCE_VIEWS, MAPPING_RANGES, REFRESH_STAMP, merge_piece 64B — CPU tarafı (kart darboğazında fps'e az yansır), sonra.
 11. Pho/Trident lazy copy-back (kaynağı açık mı bilinmiyor).
 Park (eski): JOIN_PARTS=2 görüntü korur mu; T2 ListViews kayıtlar arası cache; LAZY_COPYBACK (fxceless #1178); write marks (Marvisak); PAGE_MIRROR (timibloozinger); Neptune siyah ekran sebebi.
-Bekleyen raporlar (12:30): Sol #1171 portu. GELDİ: Sol genel tarama 12:00; Neon scarlett/mandyhub/odycal 12:30 (ADAYLAR.md'ye işlendi; mandyhub yalnız launcher, port yok). Çökme paketi (#922/#964/#936/#432) ve yüz düzeltmeleri hız testlerinden sonra.
+Bekleyen raporlar (12:30): Sol #1171 portu. GELDİ: Sol genel tarama 12:00; Neon scarlett/mandyhub/odycal 12:30 (ADAYLAR.md'ye işlendi; mandyhub yalnız launcher, port yok). Çökme paketi (#922/#964/#936/#432) ve yüz düzeltmeleri hız testlerinden sonra. | 12:47 Neon: GPU darboğazı araştırması (kim ölçtü / kim kart süresini düşürdü, veriyle; ucuz pass başı ölçüm yolu). Yiğit: "kör gitmeye datasız gitmeye gerek yok" → teşhis hız denemelerinin önüne.
 Topluluk: BlatWolf (Win10, 4060) — Agility ile çalıştı, GPU %100; TDR için TdrDelay=10 önerildi.
 
 ## Hedef + sıradaki adımlar
