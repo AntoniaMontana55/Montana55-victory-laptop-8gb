@@ -81,6 +81,8 @@ python profil_oku.py <birleşik profil> --kisa [--ara shadow::lookup] [--thread 
 
 Her yabancı commit için önce güvenlik incelemesi (`calisma/raporlar/guvenlik_*.md` örnekleri), sonra tek değişkenle 2 koşu.
 
+**Hazır exe/zip/installer kullanılmaz (26.11 uyarısı):** bir modding Discord'unun dağıttığı "exe"nin, kendi JDK'sını getiren bir Electron uygulaması olduğu ve gizli, karmaşıklaştırılmış bir Java yükü çalıştırarak tarayıcı girişlerini, kripto cüzdanlarını, Discord/Steam oturumlarını çalıp yüklediği bildirildi (statik analiz, X @Godly__BDS). Kural: yalnız kaynak koddan kendimiz derleriz; fork'lardan yalnız okunmuş diff alınır; repo içindeki başlatıcı/indirici `.ps1`/`.bat` çalıştırılmaz (DexNom, ad3lre, trustno1, Neptune'de var), içinden yalnız `VICTORY_*` değerleri okunur. "Hızlandırıcı", "launcher", "fps paketi" adıyla gelen ikili dosyaya dokunma.
+
 ## Güçlü sistemde (12–16 GB VRAM, 32+ GB RAM) denenecekler
 
 Bizim 8 GB / 16 GB makinede bellek yüzünden deneyemediklerimiz. Her biri ayrı koşu, tek değişken; önce bizim ayar setiyle (`kosu.ps1 -Tag taban`) kendi taban ölçümünü al.

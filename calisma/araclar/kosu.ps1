@@ -1,4 +1,4 @@
-# Güncel en iyi ayarlarla (B13b / c0-ltosuz tabanı) tek komutla ölçüm koşusu.
+﻿# Güncel en iyi ayarlarla (B13b / c0-ltosuz tabanı) tek komutla ölçüm koşusu.
 # Taban koşul her seferinde aynı kalsın diye ayarlar burada sabit; deneme yalnız -Ek ile eklenir (TEK değişken).
 # Kullanım:
 #   kosu.ps1 -Tag p1-profil -Ek @{ VICTORY_PROFILE = '150,240,10,C:\...\profil.txt' }
@@ -73,5 +73,8 @@ if ($DryRun) { $arg.DryRun = $true }
 if (-not $DryRun) {
     Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
         (Join-Path $PSScriptRoot 'erken_teshis.ps1') | Out-Null
+    # PC kullanımı kaydı (26.11): Yiğit koşu sırasında PC'yi kullanabilir; bozulan koşuyu bu kayıt ayıklar.
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        (Join-Path $PSScriptRoot 'kullanim_izle.ps1'), '-Tag', $Tag, '-Dakika', ($Dakika + 2) | Out-Null
 }
 & (Join-Path $PSScriptRoot 'olcum_profili.ps1') @arg

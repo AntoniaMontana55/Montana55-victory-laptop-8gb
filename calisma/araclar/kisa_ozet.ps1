@@ -44,4 +44,17 @@ $csv = Join-Path $Kosu 'olcum.csv'
 $basBos = if (Test-Path $csv) { $r = @(Import-Csv $csv | Select-Object -First 2); if ($r.Count) { '{0:N1}' -f [double]$r[0].BosRAM_GB } else { '?' } } else { '?' }
 $enAz = if (Test-Path $csv) { '{0:N2}' -f ((Import-Csv $csv | Measure-Object BosRAM_GB -Minimum).Minimum) } else { '?' }
 "başta boş RAM $basBos GB, en düşük $enAz GB"
+# PC kullanımı (kullanim_izle.ps1): oyun önde değilse ya da başka programlar CPU yediyse koşu KİRLİ sayılır.
+$etiket = ($ad -split '_', 2)[1]
+$kul = Join-Path (Split-Path $Kosu) "kullanim_$etiket.csv"
+if (Test-Path $kul) {
+    $k = @(Import-Csv $kul | Select-Object -Skip 1)
+    if ($k.Count) {
+        $onde = 100.0 * @($k | Where-Object { $_.on_surec -match '^(victory|game_scarlett_master)$' }).Count / $k.Count
+        $cpu = $k | ForEach-Object { [double]::Parse($_.diger_cpu_cekirdek, [Globalization.CultureInfo]::InvariantCulture) } | Measure-Object -Average -Maximum
+        $digerOn = ($k | Where-Object { $_.on_surec -notmatch '^(victory|game_scarlett_master)$' } | Group-Object on_surec | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) $([int](2 * $_.Count)) sn" }) -join ', '
+        $kirli = $onde -lt 90 -or $cpu.Average -gt 1.5
+        "kullanım: oyun önde %{0:N0}, diğer programlar CPU ort {1:N1} / tepe {2:N1} çekirdek{3}{4}" -f $onde, $cpu.Average, $cpu.Maximum, $(if ($digerOn) { " | önde: $digerOn" } else { '' }), $(if ($kirli) { ' | ⚠ KİRLİ' } else { ' | temiz' })
+    }
+}
 "{0} | ilk dünya {1} sn | dünya n={2} medyan {3} ms ({4:N1} fps) p90 {5} | @{6} sn: kilitli paylaşım {7} MB, kart {8} MB, {9}, {10}" -f $ad, $ilkDunya, $dunya.Count, $medyan, (1000 / [math]::Max($medyan, 1)), $p90, $an, $kilitli, $kart, $pen, $priv
