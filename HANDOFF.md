@@ -49,7 +49,9 @@ Araçlar `calisma/araclar/`. Başlamadan oku: `calisma/belgeler/KOSU_RECETESI.md
 
 ## Güncel en iyi ayar seti (kosu.ps1 içinde)
 
-`RELAY=2, RELAY_COPY=1, WIDE_BACK=1, JOIN_COPIES=1, INDIRECT_BATCH=2, INDIRECT_WINDOW=1, TEXTURE_BUDGET_MB=1024, TEXTURE_NO_WAIT=1, WINDOW_KB=256, WINDOW_TAILS=1, WINDOWS_BAR_MB=2048, WINDOWS_BAR_PERCENT=88, SEND_KEPT_MB=128, CARD_AWAKE=0, CARD_REHASH_RUNS=1, CARD_STEPS=2, UNDER_WIDE=0, LAND_ECHO=0, MAP_THREADS=1, TITLE_PRIORITIES=0, BOOK=0, PIPELINE_BOOK=1, MEMORY_MAP=1, SHOW_AFTER=1, AMBIENT=0.8, D3D12_DRED=light` (hepsi `VICTORY_` önekli). Pipeline önbelleği bir kez: `victory warm --used --jobs 4` (ilk dünya 177 → 105 sn, takılma p90 640 → 309 ms).
+`RELAY=2, RELAY_COPY=1, WIDE_BACK=1, JOIN_COPIES=1, INDIRECT_BATCH=2, INDIRECT_WINDOW=1, TEXTURE_BUDGET_MB=1024, TEXTURE_NO_WAIT=1, WINDOW_KB=256, WINDOW_TAILS=1, WINDOWS_BAR_MB=2048, WINDOWS_BAR_PERCENT=88, SEND_KEPT_MB=128, CARD_AWAKE=0, CARD_REHASH_RUNS=1, CARD_STEPS=2, UNDER_WIDE=0, LAND_ECHO=0, MAP_THREADS=1, TITLE_PRIORITIES=0, BOOK=0, PIPELINE_BOOK=1, MEMORY_MAP=1, SHOW_AFTER=1, AMBIENT=0.8, D3D12_DRED=light, DYNAMIC_SLOTS=524288` (hepsi `VICTORY_` önekli).
+
+**NVIDIA'ya özel (26.11, D1):** 1 milyon view sınırlı heap'te dinamik tablo havuzu sabit 2^18'di ve `VICTORY_DYNAMIC_SLOTS` yok sayılıyordu; kare başına ~11 bin tablonun 560-1.360'ı reddedilip o çizimler **düşüyordu** (log'daki "dropped … indirect"). Kod artık 1M heap'te de bu ayarı dinliyor (en çok heap'in yarısı; trustno1-coder a9632bc8'den). `524288` ile reddedilen 0, düşen indirect 0, oturmuş kare süresi aynı (~145-180 ms), görüntü temiz. Pipeline önbelleği bir kez: `victory warm --used --jobs 4` (ilk dünya 177 → 105 sn, takılma p90 640 → 309 ms).
 
 ## Denendi, işe yaramadı (tekrar deneme)
 
@@ -61,6 +63,14 @@ Araçlar `calisma/araclar/`. Başlamadan oku: `calisma/belgeler/KOSU_RECETESI.md
 | Marvisak e04c0781 shader sabit tablosu (elle taşıma) | RAM kazancı yok, görüntü şüpheli |
 | Neptune `CLAMP_AFTER_WRITER` | bizde `INDIRECT_BATCH=2` zaten var (~155 clamp/kare); onların 4.6→8.4 fps'i batch olmamasından |
 | fxceless #2856 (geniş pencere kapsar) | bizde descriptor slotları isimle bulunmalı, bayat pencere riski |
+| `VICTORY_RAW_VIEWS=0` | 149.7 vs 149.9 ms → fark yok |
+| `CARD_BUFFERS_MIN_MB=1` (8 GB kart) | GPU 42 → 201 ms, kare 2× yavaş |
+| `VICTORY_ASYNC_SUBMIT=1` | 147.9/155.6 vs 154.3 ms → nötr |
+| `VICTORY_JOIN_PARTS=8` | görüntü bulanık/yıkanmış → **ret** |
+| `VICTORY_MEMORY_MAP=0` | 172/167 vs 161/156 ms → fark yok |
+| `VICTORY_RAM_TRIM_MB=2048` (bizim RT1) | +%45-55 yavaş (havuzlar hep boş); `=300` nötr, yükleme etkisi belirsiz |
+| Kesin tablo-slotu yazmaları (bizim S1) | karşılaştırma 240.5 → 238.7 MB, etkisiz |
+| Neptune_VI build (bizim makinede) | 175-281 ms + siyah ekran |
 
 ## Profil (karenin nereye gittiği)
 
