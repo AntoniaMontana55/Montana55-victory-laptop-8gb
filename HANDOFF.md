@@ -81,6 +81,28 @@ python profil_oku.py <birleşik profil> --kisa [--ara shadow::lookup] [--thread 
 
 Her yabancı commit için önce güvenlik incelemesi (`calisma/raporlar/guvenlik_*.md` örnekleri), sonra tek değişkenle 2 koşu.
 
+## Takip ettiğimiz repolar
+
+Ayrıntı ve commit bazında değerlendirme: `calisma/raporlar/HASAT_MATRISI.md` (bizde var/yok, 8/16 GB değeri, risk), `calisma/belgeler/ADAYLAR.md`, `calisma/raporlar/watcher.md`.
+
+| Repo | Neden takipte | Bizdeki durum |
+|---|---|---|
+| [Marvisak/VIctory](https://github.com/Marvisak/VIctory) | upstream | #2948 (readback), #2958 (mark atomikleri) aday; #2088/#2112/#2921 incelendi |
+| [fxceless/victory-fork](https://github.com/fxceless/victory-fork) | ana topluluk fork'u, en hareketli | #1237 (lookup cache, profilde bizde %0.18 → düşük), #1172, #1229–#1233 (geri kopya) aday; #2856 ret |
+| [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) | **bizim taban** (@0a435665) | yeni commit gelirse taşınır |
+| [zm0kiemedia/Neptune_VI](https://github.com/zm0kiemedia/Neptune_VI) | Neptune (Traffic & zm0kie), high-end'de 20+ fps | CLAMP ret; geri kopya paketi (QUIET_BACK, COPY_CHANGED, UNDER_WRITES_*) ve placement.rs aday — `neptune_traffic_inceleme.md` |
+| [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb) | en yakın donanım (RTX 5060 Laptop 8 GB) | lto ret; TEXTURE_DROP_MIPS=2, wave32 CBV aday — `soldsawn_inceleme.md` |
+| [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) | bizim tabanla aynı + 9 commit, "20–22 fps" | iddia 960×540 + Smooth Motion (ara kare); DYNAMIC_SLOTS, BVH_MISS, RENDER_SCALE aday — `trustno1_nvidia_inceleme.md` |
+| [ZSlayerHQ/zslayer-pc-port-runtime](https://github.com/ZSlayerHQ/zslayer-pc-port-runtime) | Series S present (PR #10) | present portu bizde (2706abd) |
+| [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) | sayfa havuzu yerinde (0434b3ac), 788ea46 | aday — `belobug.md` |
+| [CSTCryst/VIctory-Cryst-NVIDIA](https://github.com/CSTCryst/VIctory-Cryst-NVIDIA) | NVIDIA fork | izleniyor |
+| [myokex/victory-amd](https://github.com/myokex/victory-amd) | JOURNAL_FREE (aa8399e5, 179→159 ms iddiası) | aday, önce güvenlik incelemesi |
+| [triippywhale/victory-fork](https://github.com/triippywhale/victory-fork) | CBV_IN_PLACE, BACK_CURRENT | izleniyor |
+| [timibloozinger/VIctory-compact](https://github.com/timibloozinger/VIctory-compact) | page mirror (RAM) | güven düşük (0★, yeni), park |
+| [KomanderDG88/VIniVIdiVIci](https://github.com/KomanderDG88/VIniVIdiVIci) | TEXTURE_SPILL | izleniyor |
+| [xcl-dev/xcl](https://github.com/xcl-dev/xcl) | başka katman, davranış referansı | yalnız referans — `xcl.md` |
+| [LooperSalty/AnyXboxX](https://github.com/LooperSalty/AnyXboxX), [ThatRecompDev/five-star-recomp](https://github.com/ThatRecompDev/five-star-recomp) | tanı araçları fikirleri | referans — `tani_yontemleri.md` |
+
 ## Nerede ne var
 
 - `calisma/belgeler/STATUS.md` — günlük (en yeni üstte), kanıtlı / tahmin ayrımıyla.
