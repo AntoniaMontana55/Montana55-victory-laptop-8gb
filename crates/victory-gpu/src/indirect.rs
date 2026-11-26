@@ -446,7 +446,7 @@ fn clamp_into(
     list: &HostList,
     c: &Clamp,
     dst: &ID3D12Resource,
-    budget: u64,
+    budget: &ID3D12Resource,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
@@ -470,7 +470,7 @@ fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
+    budget: &ID3D12Resource,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -485,7 +485,9 @@ fn record_clamp_as(
     };
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+    // SAFETY: a live budget buffer owned by the list.
+    let budget_gpu = unsafe { budget.GetGPUVirtualAddress() };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget_gpu.is_multiple_of(4) {
         return false;
     }
     let (src_gpu, args_offset) = match src_offset
@@ -538,8 +540,16 @@ fn record_clamp_as(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
+    // The scratch transition orders all later ExecuteIndirect reads. The
+    // budget stays in UAV use across clamps. A GPU copy-out uses its own
+    // transition, and mapped reads happen after GPU completion.
+    let global_wait = global_clamp_waits();
     let second = [
-        uav_barrier(),
+        if global_wait {
+            uav_barrier()
+        } else {
+            resource_uav_barrier(Some(budget))
+        },
         transition(
             dst,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -557,10 +567,11 @@ fn record_clamp_as(
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.SetComputeRootUnorderedAccessView(4, budget_gpu);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        let skip_post = usize::from(!waits || (!global_wait && records == 0));
+        l.ResourceBarrier(&second[skip_post..]);
     }
     true
 }
@@ -633,6 +644,8 @@ pub(crate) fn prepare_batch(
     let mut sources = [gpu(source.1)?; batch::SOURCES];
     ids[0] = source.0;
     let budget = if prelude { list.prelude_budget()? } else { list.budget()? };
+    // SAFETY: the list owns this live buffer.
+    let budget = unsafe { budget.GetGPUVirtualAddress() };
     let (jobs, at) = list.scratch(batch::TABLE)?;
     let (dst, base, before) = list.batch_place()?;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
@@ -657,13 +670,29 @@ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12R
     make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
 }
 
+// VICTORY_CLAMP_WAITS=0 scopes the post-clamp UAV wait to the budget
+// (victory-scarlett f748fb557a / Trexies 6b358fe). Keep the pre-clamp
+// wait for title writes to the argument and optional count SRVs.
+fn global_clamp_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAITS").is_none_or(|v| v != "0"))
+}
+
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    resource_uav_barrier(None)
+}
+
+fn resource_uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                // SAFETY: like a transition, the barrier borrows the
+                // resource pointer for recording and never releases it.
+                pResource: std::mem::ManuallyDrop::new(
+                    resource.map(|r| unsafe { std::mem::transmute_copy(r) }),
+                ),
             }),
         },
     }
@@ -2151,7 +2180,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let src_bytes = ARGS_OFFSET + (STRIDE as usize) * (MAX as usize) + 64;
         let (src_buf, src_ptr, _) = warp.shared_buffer(src_bytes as u64);
         let (count_buf, count_ptr, _) = warp.shared_buffer(512);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
         let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
@@ -2216,7 +2245,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             &warp.clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            &budget_buf,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -2263,7 +2292,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             &warp.clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-            budget_gpu,
+            &budget_buf,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
@@ -2367,7 +2396,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         for ahead in [true, false] {
             let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
-            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
             let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
             let dst_buf = warp.default_uav(total as u64);
             // SAFETY: mapped buffers of these sizes.
@@ -2380,7 +2409,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 &warp.clamp,
                 &warp.list,
                 (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-                budget_gpu,
+                &budget_buf,
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
@@ -2432,7 +2461,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(total_bytes as u64);
         let dst_buf = warp.default_uav(total_bytes as u64);
 
@@ -2464,7 +2493,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             &warp.clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            &budget_buf,
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
@@ -2655,7 +2684,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let counts = [100u32, 250, 50, 100];
         let total = counts.len() * STRIDE as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
         let dst_buf = warp.default_uav(total as u64);
         // SAFETY: mapped buffers of these sizes.
@@ -2675,7 +2704,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             &clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            &budget_buf,
             (&src_buf, 0),
             None,
             (KIND_DRAW, STRIDE, counts.len() as u32),
@@ -2839,7 +2868,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let windows: [&[u32]; 2] = [&[1, 2, 3, 4], &[10, 11, 12, 13]];
         let sources: Vec<ID3D12Resource> =
             windows.iter().map(|g| dispatch_records(&warp, g, STEP)).collect();
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, _) = warp.shared_buffer(256);
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let dst_buf = warp.default_uav(u64::from(STEP) * 4);
         let sig = warp.signature(KIND_DISPATCH, STRIDE);
@@ -2854,7 +2883,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 &warp.clamp,
                 &warp.list,
                 (&dst_buf, state),
-                budget_gpu,
+                &budget_buf,
                 (src, 0),
                 None,
                 (KIND_DISPATCH, STEP, groups.len() as u32),
@@ -3076,7 +3105,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let runs = if asked > 1 << 20 { 65_535 } else { asked };
             for batched in [false, true] {
                 let (src, src_ptr, src_gpu) = gpu.shared_buffer(1024);
-                let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+                let (budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
                 let (_table, table_ptr, table_gpu) = gpu.shared_buffer(batch::TABLE);
                 let size = 16 + (4 << 20) + 16;
                 let seen = gpu.default_uav(size);
@@ -3094,7 +3123,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
-                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, &budget, (&src, 0), None, (2, 12, 1), false));
                     }
                     gpu.list.SetComputeRootSignature(&worker.root);
                     gpu.list.SetPipelineState(&worker.pso);
@@ -3183,7 +3212,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 }
             }
         }
-        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
         let dst = warp.default_uav(64 << 10);
         let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
@@ -3209,7 +3238,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         &warp.clamp,
                         &warp.list,
                         (&dst, D3D12_RESOURCE_STATE_COMMON),
-                        budget_gpu,
+                        &budget_buf,
                         (&src, offset),
                         None,
                         (*kind, stride, 1),
@@ -3378,7 +3407,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let mut table = batch::Table::default();
                 for i in 0..EXECUTIONS {
                     if run == 0 {
-                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), &budget, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
                     } else if i % run == 0 {
                         let k = u64::from(i / run) * batch::TABLE;
                         batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);

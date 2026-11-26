@@ -11,6 +11,9 @@ YENİ SIRA (Neon GPU araştırması 12:55, veriyle):
 G0. [BİTTİ 13:05, gt-teshis] GPU_TIMING=1 + DRED (her liste tek başına; kare 325 ms olması bu yüzden normal). ★ BULGU (kanıt): tek bir komut baskın — indirect compute **3592426e3e9142d8**, tek başına **32.5 ve 42.5 ms** (84 komutluk liste 50-62 ms) = bizim "43-48 ms'lik submission". Bir null görünüm okuyor (u4 heap 338204: null). İkinci: 10-14k komutluk büyük listelerde (53-88 ms) küçük doku yüklemeleri (16x16 mip, staging'den) 8-30 ms "yiyor" = kart orada duruyor. Diğerleri küçük: 4a05640ec16718ad ~3.4 ms, 14264103296aa43a 4.6, cb6adcc6 (ScreenProbes) 1.6. Neon: 3592426e kim, çözen var mı (13:05).
 G0b. [BİTTİ 13:20] SKIP 3592426e (=ProbeGather, Neon/XTP): skc temiz çift 149.9 → 134.6 ms, p90 587 → 150; görüntü bozuk (renkli bloklar) → ret, tavan ~15 ms. Neon: aynı desen Marvisak#898 (null görünüm + döngü), LOOP_LIMIT 4096 ile 183 → 79 ms. Bizde varsayılan 1<<20.
 G0c. [RET 13:45] LOOP_LIMIT=4096: 159.3 → 158.8 ms (temiz çift), llb kirli. Döngü değil → sıradaki VRAM_WINDOW portu (Neon, Sol CLAMP_WAITS bitince — aynı dosya kümesi).
+G0d. [koşuyor 13:52] CLAMP_WAITS=0 (Sol portu 02d7284) cwa/cwb.
+G0e. [sırada, otomatik] CARD_WINDOWS_MB=768 (KODSUZ; varsayılan 0 = shader'ların okuduğu pencereler sistem RAM'inde kalıyordu!) kwa/kwb. Kanıt: #2705 CARD_COPIES ProbeGather 908 → 350 ms; GTX 1660 271 → 100 ms. Not: kapı "kartın beşte biri boşsa" — bizde ~0.9 GB boş, taşımayabilir; log'da pencere sayısına bak.
+GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
 G3. HOIST_CLAMPS / CLAMP_AFTER_WRITER (fxceless #1184 kontrollü A/B 5070 Ti: kart 127 → 107 ms; Neptune 09222fa7 4.6 → 8.4 fps).
