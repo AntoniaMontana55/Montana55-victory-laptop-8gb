@@ -6,6 +6,9 @@ Hız (sırayla):
 1. [RET 12:05] DROP_MIPS=1: 153->168, 160->170 ms (iki temiz çift, yavaşlattı; kart 6.3/7.1 GB, VRAM taşmıyor). DROP_MIPS=2 de düştü.
 1a. [Sol portluyor] fxceless #1171 indirect gruplama (3090 Ti: GPU 56->43 ms) — opt-in, Sol taraması 12:00'nin 1 numarası.
 1b. fxceless #1227 CARD_SYNC_BATCH (send+hash kartta 29->6 ms; 6aed0780) — #1171'den sonra.
+1d. scarlett CLAMP_WAITS=0 (~30 satır; clamp başına 2 tam bekleme; Trexies ~30-50 ms kart) — #1171 ile aynı dosya, ondan sonra.
+1e. odycal VRAM_WINDOW=1 (~500-700 satır): pencereler VRAM'e; kart sistem RAM'inden okumayı bırakır (TAHMİN). #413'ün tersine taşmada kendini kapatıyor.
+1f. Teşhis: scarlett CARD_METER_KINDS/PIPELINES — 150 ms kart süresinin türlere dağılımı (madde 4'ün alternatifi).
 1c. Ölçüm serisi öncesi `victory shaders` + `warm --used` tazele (BVH_MISS/RT anahtarları değişti; Discord bdoe "pre warm" tarifi). Fps'i değil takılma/dünyaya giriş süresini düzeltir (03:50 warm kanıtı).
 2. SEND_BAR=1 (kodsuz, send.rs:137).
 3. ~~DROP_MIPS=2~~ (1 reddedildi).
@@ -19,7 +22,7 @@ Hız dışı:
 10. Vertex: SKIP_WC_COMPARE/SHARED (geri kopya 85→9 MB), GUARDS RwLock + ASK_ONCE_VIEWS, MAPPING_RANGES, REFRESH_STAMP, merge_piece 64B — CPU tarafı (kart darboğazında fps'e az yansır), sonra.
 11. Pho/Trident lazy copy-back (kaynağı açık mı bilinmiyor).
 Park (eski): JOIN_PARTS=2 görüntü korur mu; T2 ListViews kayıtlar arası cache; LAZY_COPYBACK (fxceless #1178); write marks (Marvisak); PAGE_MIRROR (timibloozinger); Neptune siyah ekran sebebi.
-Bekleyen raporlar (12:15): Neon victory-scarlett 2. deneme (ilki 2 saat takıldı, iptal), Neon Z-rox/mandyhub, Neon K0NL/odycal, Sol #1171 portu. Sol genel tarama GELDİ 12:00 (#1171, #1227, #648, klbf DXIL, xmem SECTION_MB).
+Bekleyen raporlar (12:30): Sol #1171 portu. GELDİ: Sol genel tarama 12:00; Neon scarlett/mandyhub/odycal 12:30 (ADAYLAR.md'ye işlendi; mandyhub yalnız launcher, port yok). Çökme paketi (#922/#964/#936/#432) ve yüz düzeltmeleri hız testlerinden sonra.
 Topluluk: BlatWolf (Win10, 4060) — Agility ile çalıştı, GPU %100; TDR için TdrDelay=10 önerildi.
 
 ## Hedef + sıradaki adımlar
