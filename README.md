@@ -1,3 +1,5 @@
+> **Bu fork:** NVIDIA 8 GB VRAM + 16 GB RAM (RTX 3070 Ti Laptop) için çalışma dalı. Durum, derleme, ölçüm düzeni, denenip reddedilenler ve sıradaki adımlar: **[HANDOFF.md](HANDOFF.md)**. Oyun dosyası içermez.
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
