@@ -19,6 +19,8 @@ G0g. [sırada, otomatik, ML'den sonra] RIPE_BLOCKS=4 + CARD_WINDOWS_MB=768 (rba/
 ÖLÇÜM DÜZELTMESİ (Yiğit 14:45 gözlemi): egilim.py — ilk üçte bir yükleme sıçramaları (yüzlerce-binlerce ms), aynı tabanlar son dilimde 134-172 ms arası oynuyor → 80 sn'lik tek çift %5-10 altını ayıramaz. Bundan sonra: tarama kısa kalabilir, ama <%10 / karışık sonuç = dünya+150 sn ve SON 60 SN medyanı ile teyit (2 çift). LOOP_LIMIT bu yüzden yeniden (lla son dilim: taban 172 / loop 154 — tek çift belirsizdi). rb serisi de 150 sn.
 G0f3. [RET 14:55] MESH_LAUNCH: 146→168, 139→178 ms (iki çift, kesin). Ampere'de amplification aşaması pahalı (TAHMİN).
 G0g. [BELİRSİZ 15:15] RIPE4+WIN768: 146→143, 149→147 (gürültü); kart %81 → kapı %80 hâlâ engel. LOOP_LIMIT teyit: 152 vs 146/149 → ret kesin. G0h. [koşuyor 15:17] RIPE4 + CARD_WINDOWS_MB=1536 + CARD_WINDOWS_PERCENT=95 (yeni anahtar 64631e4), wpa/wpb 150 sn.
+G0h. [KARIŞIK 15:30] RIPE4 + CARD_WINDOWS_MB=1536 + PERCENT=95: pencereler İLK KEZ karta gitti (kart kopyaları 12 → 495/665, +300-400 MB). wpa 146 → 137 (−%6), wpb 146 → 147. Teşhis: gtw-teshis-win95 (GPU_TIMING) — ProbeGather 32-42 ms düştü mü?
+G0i. [TEŞHİS 15:45] gtw-teshis-win95: ProbeGather sabit ~1 ms/kare, yalnız sıçramalarda 26-42 ms → kalıcı darboğaz değil. Kart süresi birçok compute grubuna yayılmış. Sıradaki: wp onay çifti (150 sn) + sıradaki aday CARD_SYNC_BATCH/HOIST_CLAMPS.
 GOAL (Yiğit 13:47): Sol her 3 saatte portwatch tracker.json dahil tarama (cron 6330ca1c, 16:43'ten itibaren), testler bulgulara göre.
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).

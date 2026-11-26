@@ -57,6 +57,7 @@ Bu yüzden CPU/RAM tarafında kazandıran ayarlar başkasında fps artırsa da b
 |---|---|---|
 | GPU_TIMING=1 + DRED (gt-teshis, 26.11 13:05) | tek komut baskın: indirect compute **3592426e3e9142d8 = ProbeGather** (ışık probu ışın toplama, XTP shader-roles), tek başına 32.5 / 42.5 ms | Başkasında: 4060 Ti 8 GB ort 9 ms, en kötü 40.7 ms (fxceless #10). Büyük listelerdeki "doku yükleme 8-30 ms" ölçüm hatası: liste başına 4096 damga, kalan komutlar sonuncuya yazılıyor (host.rs STAMPS). |
 | SKIP_PIPELINES=3592426e3e9142d8 (tavan ölçümü) | temiz çift skc: **149.9 → 134.6 ms (−%10)**, p90 587 → 150 (takılmalar kayboldu); diğer çiftler 145/146 (tabanları kirli) | Kazanç tavanı ~15 ms + takılmalar. **Görüntü bozuluyor** (duvar posterlerinde renkli bozuk kareler) → atlamak çözüm değil; shader'ın kendisi hızlanmalı (LOOP_LIMIT testi). |
+| GPU_TIMING + pencereler kartta (gtw-teshis-win95, 26.11 15:28; RIPE4, WIN1536, PERCENT95) | ProbeGather kare başına **~1 ms** (eski koşuda da 0.6-1.7 ms); 32-42 ms olan tek tük sıçramalardı, şimdi en uzunu 26-28 ms. Kart süresi tek komutta değil, 13-22 listelik birçok gruba yayılmış (her biri 9-18 ms/kare). | **Düzeltme:** ProbeGather kalıcı darboğaz değil, ara sıra takılma kaynağı. Pencereleri karta taşımak sıçramayı ~%30 kısalttı. Atlayınca gelen 15 ms'lik kazanç büyük ihtimalle takılmaların kaybolmasından geliyor. #2705 CARD_COPIES bu yüzden öncelikten düştü. |
 
 ## Belirsiz / tekrar gerek
 
