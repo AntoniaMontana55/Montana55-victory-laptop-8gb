@@ -116,6 +116,8 @@ $env:VICTORY_TITLE_PRIORITIES         = '0'
 # uzerine sifir yaziyor (texture.rs:376-388). Doku butunlugu once gelir.
 $env:VICTORY_TEXTURE_NO_WAIT          = '0'
 $env:VICTORY_TEXTURE_FILL             = '0'
+# Erken upload'larin ilk kare siyah/gri cikmasi ahead.rs:1-7'de belgeli.
+$env:VICTORY_UPLOAD_AHEAD             = '0'
 $env:VICTORY_SEND_KEPT_MB             = '128'
 $env:VICTORY_WINDOW_KB                = '256'
 $env:VICTORY_WINDOW_TAILS             = '1'
@@ -143,7 +145,7 @@ if ($turboMode) {
     $env:VICTORY_THIN              = '1'
     $env:VICTORY_THIN_THREADS      = '6'
     $env:VICTORY_ASYNC_SUBMIT      = '1'
-    $env:VICTORY_UPLOAD_AHEAD      = '1'
+    $env:VICTORY_UPLOAD_AHEAD      = '0'
     $env:VICTORY_PORT_DESCRIPTORS  = '0'
     $env:VICTORY_PORT_GUARD        = '1'
     $env:VICTORY_PORT_JOURNAL      = '1'
@@ -221,15 +223,15 @@ $env:VICTORY_CLAMP_WAITS      = 'ON'
 
 # === UPSCALER & CIKIS GUVENLIGI ===
 if ($useFsr -and $consoleProfile -eq 'series-s') {
-    # FSR4 yalniz 1280x720 render kabul ediyor; 0.75 olcek 960x540/768x432
-    # uretip "Shipping FSR4 configuration mismatch" ve device removal veriyor.
-    $outRes = '1280x720'
-    $scale  = '1.0'
-    $env:VICTORY_UPSCALER     = '7'
-    $env:VICTORY_OUTPUT       = $outRes
-    $env:VICTORY_RENDER_SCALE = $scale
-    $env:VICTORY_RESOLUTION   = $outRes
-    $presetLabel = "$Preset [FSR4 Sabit 1280x720 -> 1080p]"
+    # FSR4 render size 1280x720 olmali: cikis 1080p, FFX olcegi 2/3.
+    # 0.75/0.5 olcek 768x432 uretip "Shipping FSR4 configuration mismatch"
+    # ve device removal veriyor (resolution.rs:27-37).
+    $env:VICTORY_UPSCALER  = '7'
+    $env:VICTORY_OUTPUT    = '1920x1080'
+    $env:VICTORY_FFX_SCALE = '0.6667'
+    Remove-Item Env:VICTORY_RENDER_SCALE -ErrorAction SilentlyContinue
+    Remove-Item Env:VICTORY_RESOLUTION   -ErrorAction SilentlyContinue
+    $presetLabel = "$Preset [FSR4 1280x720 -> 1080p]"
 } else {
     $env:VICTORY_UPSCALER = '6'
     $env:VICTORY_OUTPUT   = $outRes
