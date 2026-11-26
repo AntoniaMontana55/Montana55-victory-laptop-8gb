@@ -1,6 +1,7 @@
 # STATUS — victory-fork katkısı
 
 ## TEST LİSTESİ — UNUTMA (Yiğit 26.11 12:02 "bunları unutma"; her adım bitince güncelle)
+ROLLER (Yiğit 26.11 13:40): Sol = araştırma/tarama/güvenlik incelemesi, Neon = kod/port. Claude = plan, diff, derleme, A/B, overlay, kayıt. (Sol'un CLAMP_WAITS portu başlamıştı, o biter.)
 Gerçek: darboğaz EKRAN KARTI (%91-100). Yalnız kart işini azaltan şey fps'e yansır. Şu an hapishane ~150 ms (6.7 fps), RT paketi tabanda.
 Hız (sırayla):
 1. [RET 12:05] DROP_MIPS=1: 153->168, 160->170 ms (iki temiz çift, yavaşlattı; kart 6.3/7.1 GB, VRAM taşmıyor). DROP_MIPS=2 de düştü.
@@ -9,7 +10,7 @@ Hız (sırayla):
 YENİ SIRA (Neon GPU araştırması 12:55, veriyle):
 G0. [BİTTİ 13:05, gt-teshis] GPU_TIMING=1 + DRED (her liste tek başına; kare 325 ms olması bu yüzden normal). ★ BULGU (kanıt): tek bir komut baskın — indirect compute **3592426e3e9142d8**, tek başına **32.5 ve 42.5 ms** (84 komutluk liste 50-62 ms) = bizim "43-48 ms'lik submission". Bir null görünüm okuyor (u4 heap 338204: null). İkinci: 10-14k komutluk büyük listelerde (53-88 ms) küçük doku yüklemeleri (16x16 mip, staging'den) 8-30 ms "yiyor" = kart orada duruyor. Diğerleri küçük: 4a05640ec16718ad ~3.4 ms, 14264103296aa43a 4.6, cb6adcc6 (ScreenProbes) 1.6. Neon: 3592426e kim, çözen var mı (13:05).
 G0b. [BİTTİ 13:20] SKIP 3592426e (=ProbeGather, Neon/XTP): skc temiz çift 149.9 → 134.6 ms, p90 587 → 150; görüntü bozuk (renkli bloklar) → ret, tavan ~15 ms. Neon: aynı desen Marvisak#898 (null görünüm + döngü), LOOP_LIMIT 4096 ile 183 → 79 ms. Bizde varsayılan 1<<20.
-G0c. [koşuyor 13:22] SHADER_LOOP_LIMIT=4096 (diag; önbellek anahtarı değişir → ll0-isinma 7 dk, sonra lla/llb). Görüntüde poster/ışık kontrolü.
+G0c. [RET 13:45] LOOP_LIMIT=4096: 159.3 → 158.8 ms (temiz çift), llb kirli. Döngü değil → sıradaki VRAM_WINDOW portu (Neon, Sol CLAMP_WAITS bitince — aynı dosya kümesi).
 G1. RENDER_SCALE 0.5 + OWN_UPSCALER (trustno1 afd84de1; 5070: 110 → 82-88 ms GPU; Series S + 0.5 + BVH miss 33 ms GPU). En güçlü kanıt.
 G2. CARD_SYNC_BATCH (fxceless #1227; 3090 Ti send+hash 29.4 → 5.6 ms, kare 85 → 72).
 G3. HOIST_CLAMPS / CLAMP_AFTER_WRITER (fxceless #1184 kontrollü A/B 5070 Ti: kart 127 → 107 ms; Neptune 09222fa7 4.6 → 8.4 fps).
