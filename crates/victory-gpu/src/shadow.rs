@@ -314,6 +314,14 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Bytes of buffer copies in the card's memory and in windows (for the
+/// memory pressure log, [`crate::residency`]).
+pub(crate) fn live_span_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
@@ -1456,10 +1464,37 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+struct WideGroup {
+    left: std::sync::atomic::AtomicUsize,
+    done: (Mutex<bool>, std::sync::Condvar),
+}
+
+impl WideGroup {
+    fn new(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            left: std::sync::atomic::AtomicUsize::new(count),
+            done: (Mutex::new(false), std::sync::Condvar::new()),
+        })
+    }
+
+    fn finish(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut done = self.done.0.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+            self.done.1.notify_one();
+        }
+    }
+}
+
+struct QueuedJob {
+    job: Job,
+    group: Arc<WideGroup>,
+}
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    jobs: Mutex<std::collections::VecDeque<QueuedJob>>,
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
@@ -1501,7 +1536,7 @@ fn workers() -> &'static Workers {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    let job = {
+                    let queued = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
@@ -1515,7 +1550,8 @@ fn workers() -> &'static Workers {
                         }
                     };
                     let _working = crate::timeline::span("a job for another thread");
-                    job();
+                    (queued.job)();
+                    queued.group.finish();
                 }
             });
         }
@@ -1525,7 +1561,7 @@ fn workers() -> &'static Workers {
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
-fn wide(jobs: Vec<Job>) {
+fn wide(mut jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
@@ -1534,37 +1570,40 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let first = jobs.pop().expect("at least two jobs");
+    let group = WideGroup::new(jobs.len());
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        workers.there.fetch_add(jobs.len(), Ordering::AcqRel);
         for job in jobs {
-            let left = left.clone();
-            workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+            queue.push_back(QueuedJob { job, group: Arc::clone(&group) });
         }
     }
     workers.more.notify_all();
-    loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => {
+    first();
+    while group.left.load(Ordering::Acquire) > 0 {
+        let next = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let found = queue.iter().position(|q| Arc::ptr_eq(&q.group, &group)).and_then(|i| queue.remove(i));
+            if found.is_some() {
                 workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+            }
+            found
+        };
+        match next {
+            Some(queued) => {
+                (queued.job)();
+                queued.group.finish();
             }
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    spin(|| group.left.load(Ordering::Acquire) == 0);
+    if group.left.load(Ordering::Acquire) > 0 {
+        let mut done = group.done.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = group.done.1.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -1999,14 +2038,95 @@ impl Drop for Compared {
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
+/// byte is. Uses AVX2 32-byte SIMD comparison when available.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 availability checked at runtime above.
+            return unsafe { changed_runs_avx2(now, was) };
+        }
+    }
+    changed_runs_scalar(now, was)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        let differ = unsafe {
+            let a = _mm256_loadu_si256(now.as_ptr().add(base).cast::<__m256i>());
+            let b = _mm256_loadu_si256(was.as_ptr().add(base).cast::<__m256i>());
+            let c = _mm256_loadu_si256(now.as_ptr().add(base + 32).cast::<__m256i>());
+            let d = _mm256_loadu_si256(was.as_ptr().add(base + 32).cast::<__m256i>());
+            let lo = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+            let hi = !_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, d)) as u32;
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ == u64::MAX {
+            open.get_or_insert(base);
+        } else {
+            let mut m = differ;
+            let mut pos = 0usize;
+            if let Some(first) = open.take() {
+                let eq = (!m).trailing_zeros() as usize;
+                if eq < 64 {
+                    runs.push((first, base + eq - first));
+                    pos = eq;
+                    m &= !((1u64 << pos) - 1);
+                } else {
+                    open = Some(first);
+                    pos = 64;
+                    m = 0;
+                }
+            }
+            while m != 0 {
+                let start_bit = m.trailing_zeros() as usize;
+                let shifted = m >> start_bit;
+                let run_len = (!shifted).trailing_zeros() as usize;
+                let end_bit = start_bit + run_len;
+                if end_bit >= 64 {
+                    open = Some(base + start_bit);
+                    break;
+                }
+                runs.push((base + start_bit, run_len));
+                pos = end_bit;
+                m &= !((1u64 << pos) - 1);
+            }
+            let _ = pos;
+        }
+        base += 64;
+    }
+    let mut i = base;
+    while i < n {
+        if now[i] != was[i] {
+            open.get_or_insert(i);
+        } else if let Some(first) = open.take() {
+            runs.push((first, i - first));
+        }
+        i += 1;
+    }
+    if let Some(first) = open.take() {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
-        // Equal bytes, many at a time while they last (a page looked at
-        // under a flight's writes hardly ever differs at all).
         while i + 512 <= n && now[i..i + 512] == was[i..i + 512] {
             i += 512;
         }
@@ -2136,7 +2256,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -2204,7 +2324,7 @@ fn under_fused() -> bool {
 /// `held` is `title` afterwards.
 fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_put_avx2(title, held) };
     }
@@ -2924,6 +3044,49 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// Optional byte cap for loose title-window copies, in MiB. Unset or `0`
+/// keeps today's sweep. A positive value caps the copies only in the Watch
+/// and High RAM bands; Calm is unchanged.
+fn window_budget() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map(|v| v.saturating_mul(1 << 20))
+    })
+}
+
+/// Oldest eligible copies to remove until their unique bytes fit `keep`.
+/// Entries are `(last-used moment, bytes, unique copy identity)`, already
+/// sorted oldest first; one copy standing under several keys counts once.
+fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
+    let mut left = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    for &(_, bytes, id) in entries {
+        if seen.insert(id) {
+            left = left.saturating_add(bytes);
+        }
+    }
+    let mut out = Vec::new();
+    for (i, &(_, bytes, id)) in entries.iter().enumerate() {
+        if left <= keep {
+            break;
+        }
+        if seen.remove(&id) {
+            left = left.saturating_sub(bytes);
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Kept between sweeps so one sample near a watermark does not toggle the
+/// policy on the next submission.
+static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
+    std::sync::Mutex::new(crate::host::RamBand::Calm);
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2940,6 +3103,26 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    let budget = window_budget();
+    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut keep = u64::MAX;
+    if let Some(bytes) = budget
+        && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
+    {
+        let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
+        match *band {
+            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Watch => {
+                idle_ms = idle_ms.min(10_000);
+                keep = bytes;
+            }
+            crate::host::RamBand::High => {
+                idle_ms = idle_ms.min(2_000);
+                keep = bytes / 2;
+            }
+        }
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2947,17 +3130,28 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
+        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
-            .map(|(key, _)| *key)
+            .map(|(&key, s)| {
+                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
+            })
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+        let victims = if keep == u64::MAX {
+            (0..eligible.len()).collect()
+        } else {
+            let entries: Vec<(u64, u64, usize)> = eligible
+                .iter()
+                .map(|&(used, _, id, len)| (used, len, id))
+                .collect();
+            window_victims(&entries, keep)
+        };
+        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3807,9 +4001,9 @@ impl Shadow {
                 let fused = crate::host::words_under()
                     && under_fused()
                     && !crate::host::upcheck::on()
-                    && at % 4 == 0
-                    && lo % 4 == 0
-                    && n % 4 == 0
+                    && at.is_multiple_of(4)
+                    && lo.is_multiple_of(4)
+                    && n.is_multiple_of(4)
                     && {
                         if left.fetch_sub(most, Ordering::Relaxed) >= most {
                             true
@@ -4907,7 +5101,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -5617,8 +5811,28 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        tail_of, window_of, window_victims,
     };
+
+    #[test]
+    fn window_budget_evicts_oldest_only_until_it_fits() {
+        const M: u64 = 1 << 20;
+        // Oldest first: 10, 20 and 30 MiB. Keeping 50 MiB must free only the
+        // oldest copy (60 MiB left before, 50 MiB after).
+        let entries = [(1u64, 10 * M, 1usize), (2, 20 * M, 2), (3, 30 * M, 3)];
+        assert_eq!(window_victims(&entries, 50 * M), vec![0]);
+        // A tighter cap takes the newest as well.
+        assert_eq!(window_victims(&entries, 20 * M), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn window_budget_counts_one_copy_under_several_keys_once() {
+        const M: u64 = 1 << 20;
+        // The first two entries are one copy; 50 MiB is live, not 80.
+        // Without dedupe both would be picked to reach a 40 MiB cap.
+        let entries = [(1u64, 30 * M, 7usize), (2, 30 * M, 7), (3, 20 * M, 8)];
+        assert_eq!(window_victims(&entries, 40 * M), vec![0]);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

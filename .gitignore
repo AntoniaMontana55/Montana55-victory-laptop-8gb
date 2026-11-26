@@ -70,6 +70,11 @@
 *.7z
 *.rar
 
+# Local task notes and screenshots
+/gorev.txt.txt
+/prompt.txt.txt
+/shader.PNG
+
 # Editor / OS noise
 .vs/
 .idea/

@@ -52,15 +52,6 @@ enum NodeAt {
 }
 
 /// The ray operands, as floats.
-/// `VICTORY_BVH_MISS=1` (off by default): the node test misses every node.
-/// While the structure builder is off the structures are never built, and a
-/// walk of what lies in their memory is not the console's. Part of the shader
-/// cache key (`shader_cache.rs`).
-pub(crate) fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
-}
-
 struct Ray {
     extent: V,
     origin: [V; 3],
@@ -104,6 +95,20 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg: dst, .. } = *data else {
             return Err("a ray-tracing node test's result");
         };
+        // `VICTORY_BVH_MISS=1`: short-circuit every ray-node test to a constant
+        // miss when ray tracing is off (no BVH arenas / traversal loops).
+        static BVH_MISS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BVH_MISS.get_or_init(|| {
+            std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+                && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+        }) {
+            let guard = self.guard(b, i)?;
+            let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            for (k, &r) in miss.iter().enumerate() {
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let site = (b, i);
         let nodes = self
             .x
@@ -200,19 +205,11 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = if bvh_miss() {
-            [self.s.m.i32(bvh::NONE); 4]
-        } else {
-            self.bvh_boxes(at, kind, &ray, sort)
-        };
+        let boxes = self.bvh_boxes(at, kind, &ray, sort);
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = if bvh_miss() {
-            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
-        } else {
-            self.bvh_triangle(at, kind, &ray)
-        };
+        let triangle = self.bvh_triangle(at, kind, &ray);
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;

@@ -32,7 +32,7 @@ const SHORT: usize = 256;
 
 /// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
 fn short(at: usize, len: usize) -> bool {
-    len <= SHORT && at % 4 == 0 && len % 4 == 0
+    len <= SHORT && at.is_multiple_of(4) && len.is_multiple_of(4)
 }
 
 /// Whether a run of `len` bytes at offset `at` of a copy in the card's memory
@@ -119,34 +119,18 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
-/// `VICTORY_SEND_KEPT_MB` overrides (16 to 1024); otherwise scales automatically
-/// to 128 MiB on <=16 GB RAM hosts, 256 MiB on <=24 GB, and 768 MiB on 32+ GB.
+/// `VICTORY_SEND_KEPT_MB` caps this on 16 GB RAM hosts.
 fn kept() -> u64 {
-    static BYTES: OnceLock<u64> = OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let asked = std::env::var("VICTORY_SEND_KEPT_MB")
+    static KEPT: OnceLock<u64> = OnceLock::new();
+    *KEPT.get_or_init(|| {
+        if let Some(mb) = std::env::var("VICTORY_SEND_KEPT_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|mb| (16..=1024).contains(mb));
-        match asked {
-            Some(mb) => mb << 20,
-            None if on_card() => 256 << 20,
-            None => match super::total_physical_ram() {
-                Some(ram) if ram <= (17u64 << 30) => 128 << 20,
-                Some(ram) if ram <= (25u64 << 30) => 256 << 20,
-                _ => 768 << 20,
-            },
+        {
+            return mb.min(2048) << 20;
         }
+        if on_card() { 256 << 20 } else { 768 << 20 }
     })
-}
-
-/// Drops spare upload buffers held for reuse (called on RAM pressure).
-#[allow(dead_code)]
-pub(super) fn trim_spare() -> u64 {
-    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-    let freed: u64 = spare.iter().map(|m| m.size).sum();
-    spare.clear();
-    freed
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through

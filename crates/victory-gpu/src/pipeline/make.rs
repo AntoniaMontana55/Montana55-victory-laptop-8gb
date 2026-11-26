@@ -54,15 +54,24 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP: OnceLock<(bool, bool)> = OnceLock::new();
-    let (resolve, activate) = *SKIP.get_or_init(|| {
+    static SKIP: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    let (resolve, activate, extra) = *SKIP.get_or_init(|| {
         let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
         if on("VICTORY_BVH_BUILDER") {
-            return (false, false);
+            return (false, false, false);
         }
-        let skip = (on("VICTORY_RT_SKIP_RESOLVE"), on("VICTORY_RT_SKIP_ACTIVATE"));
-        if skip.0 || skip.1 {
-            tracing::info!(resolve = skip.0, activate = skip.1, "ray-tracing pipelines left out (no structures built)");
+        let skip = (
+            on("VICTORY_RT_SKIP_RESOLVE"),
+            on("VICTORY_RT_SKIP_ACTIVATE"),
+            on("VICTORY_RT_SKIP_EXTRA"),
+        );
+        if skip.0 || skip.1 || skip.2 {
+            tracing::info!(
+                resolve = skip.0,
+                activate = skip.1,
+                extra = skip.2,
+                "ray-tracing pipelines left out (no structures built)"
+            );
         }
         skip
     });
@@ -71,6 +80,17 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     if activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("activates rays without structures");
+    }
+    if extra {
+        if named(shaders, b"CopyForBVHUpdate") {
+            return Some("copies geometry for BVH builder which is off");
+        }
+        if named(shaders, b"RaytraceVBuffer") {
+            return Some("raytraces vbuffer without structures");
+        }
+        if named(shaders, b"CS_RTShadowTrace") {
+            return Some("traces RT shadows without structures");
+        }
     }
     None
 }
@@ -108,6 +128,7 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
@@ -266,6 +287,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -278,6 +300,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
