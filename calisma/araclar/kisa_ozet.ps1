@@ -59,7 +59,8 @@ if (Test-Path $kul) {
         $digerOn = ($k | Where-Object { $_.on_surec -notmatch '^(victory|game_scarlett_master)$' } | Group-Object on_surec | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) $([int](2 * $_.Count)) sn" }) -join ', '
         # Oyun arkada da normal çalışıyor (26.11 T1: hep %1-4 önde); ölçüt yalnız başka programların CPU'su ve boş RAM.
         $bosEn = ($k | ForEach-Object { [double]::Parse($_.bos_ram_gb, [Globalization.CultureInfo]::InvariantCulture) } | Measure-Object -Minimum).Minimum
-        $kirli = $cpu.Average -gt 3.0 -or $bosEn -lt 0.15
+        # Boş RAM ölçüt değil: oyun 16 GB'ı her koşuda kendisi dolduruyor (26.11, 4/4 koşu 0.00-0.10 GB).
+        $kirli = $cpu.Average -gt 3.0
         "kullanım: oyun önde %{0:N0}, diğer programlar CPU ort {1:N1} / tepe {2:N1} çekirdek, boş RAM en az {5:N2} GB{3}{4}" -f $onde, $cpu.Average, $cpu.Maximum, $(if ($digerOn) { " | önde: $digerOn" } else { '' }), $(if ($kirli) { ' | ⚠ KİRLİ' } else { ' | temiz' }), $bosEn
     }
 }

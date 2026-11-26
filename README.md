@@ -1,5 +1,16 @@
 > **Bu fork:** NVIDIA 8 GB VRAM + 16 GB RAM (RTX 3070 Ti Laptop) için çalışma dalı. Durum, derleme, ölçüm düzeni, denenip reddedilenler ve sıradaki adımlar: **[HANDOFF.md](HANDOFF.md)**. Oyun dosyası içermez.
 
+> **Windows 10:** the in-box D3D12 runtime stops at shader model 6.5, so the
+> game crashes early with `root signature: Unsupported bit-flag set (root
+> signature flags c01)` / `host root signature refused`. Fix: get
+> `D3D12Core.dll` from Microsoft's official NuGet package
+> [Microsoft.Direct3D.D3D12 1.620.x](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
+> (the `.nupkg` is a zip: `build\native\bin\x64\D3D12Core.dll`), put it in
+> `target\release\D3D12\D3D12Core.dll` (a `D3D12` folder next to
+> `victory.exe`), then build again (`cargo build --release -p victory`). The
+> build prints `Agility SDK exports on (Windows 10)` when it sees the DLL.
+> Without that folder nothing changes (Windows 11 uses its own runtime).
+
 # VIctory on an RX 7900 XTX
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
