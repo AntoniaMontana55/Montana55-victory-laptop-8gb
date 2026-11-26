@@ -115,6 +115,18 @@ Ayrıntı ve commit bazında değerlendirme: `calisma/raporlar/HASAT_MATRISI.md`
 | [xcl-dev/xcl](https://github.com/xcl-dev/xcl) | başka katman, davranış referansı | yalnız referans — `xcl.md` |
 | [LooperSalty/AnyXboxX](https://github.com/LooperSalty/AnyXboxX), [ThatRecompDev/five-star-recomp](https://github.com/ThatRecompDev/five-star-recomp) | tanı araçları fikirleri | referans — `tani_yontemleri.md` |
 
+## Watcher (repoları sürekli izletmek)
+
+Biz bir ajana 3 saatte bir yukarıdaki repoları taratıp `calisma/raporlar/watcher.md`'ye (en yeni üstte) yazdırıyoruz; örnek kayıtlar orada. Kendi ajanına (Claude Code, Codex, Gemini…) verebileceğin hazır görev:
+
+```text
+SALT OKUNUR. Kod indirme/derleme/çalıştırma yok; yalnız `gh api` ile oku. Tek dosyaya yaz: calisma/raporlar/watcher.md (en yeni kayıt en üstte, başlık "## <tarih saat> — <son kontrolden beri>").
+İzlenen repolar: HANDOFF.md "Takip ettiğimiz repolar" tablosu + fxceless/victory-fork'un en çok yıldızlı 15 fork'u (`gh api repos/fxceless/victory-fork/forks?sort=stargazers`).
+Her repo için son kontrolden beri: yeni commit'ler (SHA, 1 cümle ne yapıyor, env anahtarı mı varsayılan mı), yeni/merge edilen PR'lar, README'de fps/donanım iddiası.
+Öncelik: HIZ (ms/kare, CPU hazırlık, geri kopya) ve 8 GB VRAM / 16 GB RAM'e uyan BELLEK değişiklikleri. Ölçümlü iddiayı (fps, ms, donanım, sahne) TAHMİN'den ayır; ara kare (Smooth Motion/frame gen) ile ölçülmüşse belirt.
+Sonda "ÖZET" satırı: büyük gelişme var/yok + bizim dal için ilk 3 aday (bkz. calisma/raporlar/HASAT_MATRISI.md biçimi).
+```
+
 ## Nerede ne var
 
 - `calisma/belgeler/STATUS.md` — günlük (en yeni üstte), kanıtlı / tahmin ayrımıyla.
