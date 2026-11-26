@@ -31,6 +31,10 @@ $taban = [ordered]@{
     VICTORY_D3D12_DRED         = 'light'
     # D1 (26.11): 1M view heap'inde dinamik tablo yuvaları 2^18 → 524288; reddedilen tablo (= düşen çizim) ~1000/kare → 0.
     VICTORY_DYNAMIC_SLOTS      = '524288'
+    # 26.11 RT paketi kabul (rtb: 184 -> 150 ms, goruntu ayni): BVH yapisi kurulmadan bosa calisan isin izleme isi kesilir.
+    VICTORY_BVH_MISS           = '1'
+    VICTORY_RT_SKIP_RESOLVE    = '1'
+    VICTORY_RT_SKIP_ACTIVATE   = '1'
     VICTORY_INDIRECT_BATCH     = '2'
     VICTORY_INDIRECT_WINDOW    = '1'
     VICTORY_INPLACE_PROBE      = $null

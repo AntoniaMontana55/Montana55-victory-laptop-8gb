@@ -4012,7 +4012,7 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    from_base(desc, copy.base, crate::resource::dropped(resource) > 0);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4149,20 +4149,41 @@ fn make_twinned(
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
-/// on (`crate::resource::held_only`). What it shows of larger ones, if any,
+/// on (`crate::resource::held_only` or `crate::resource::drop_levels`).
+/// What it shows of larger ones, if any,
 /// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, fixed: bool) {
+    let shift = |first: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        let lost = base.saturating_sub(*first);
+        *first = first.saturating_sub(base);
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+        }
+        *clamp = (*clamp - base as f32).max(0.0);
+    };
+    // SAFETY: each arm uses the union member its dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            // Fixed mip dropping also applies to arrays and cubes (fxceless #610).
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY if fixed => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE if fixed => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY if fixed => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -4633,7 +4654,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, false);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -4642,6 +4663,14 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+        assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
+
+        let mut array = srv_desc(&[98, 5, 5768, 0, 1, 4, 2, 3, 0, 0]);
+        from_base(&mut array, 3, true);
+        // SAFETY: the view dimension is Texture2DArray.
+        let t = unsafe { array.Anonymous.Texture2DArray };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (0, 2));
+        assert_eq!((t.FirstArraySlice, t.ArraySize), (2, 3));
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.

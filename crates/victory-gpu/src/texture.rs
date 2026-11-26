@@ -56,6 +56,8 @@ pub(crate) struct Staging {
     first: u32,
     level0: u32,
     read: usize,
+    /// The title extent used for upload budgeting and residency checks.
+    title_bytes: usize,
     /// Which host copy it uploads into, and what that is told to hold.
     serial: u64,
     holds: Arc<crate::resource::Holds>,
@@ -174,6 +176,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // The alias path needs both copies to have the same levels (fxceless #610).
+    if crate::resource::dropped(placed) != crate::resource::dropped(source) {
+        return false;
+    }
     // (All of its levels: the copy is level by level.)
     crate::resource::want_level(placed, 0);
     let (Some(to), Some(from)) = (
@@ -798,7 +804,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
         let there = match picking {
-            Some(there) if there != u64::MAX => there,
+            Some(there) if there == staging.title_bytes as u64 => staging.read as u64,
+            Some(there) if there != u64::MAX && staging.read == staging.title_bytes => there,
             _ => mapped_bytes(staging.memory, staging.read),
         };
         staging.expected.store(there, Relaxed);
@@ -1563,7 +1570,9 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let layout = crate::resource::texture_layout(&desc)?;
     let layout = &layout.planes[0].layout;
-    Some((memory as u64, layout.bytes_from(crate::resource::read_from(layout, first))))
+    let drop = crate::resource::drop_levels(&desc);
+    let first = if drop > 0 { drop } else { crate::resource::read_from(layout, first) };
+    Some((memory as u64, layout.bytes_from(first)))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
@@ -1579,7 +1588,7 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    Some((s.read as u64, !ask || committed(s.memory, s.read)))
+    Some((s.title_bytes as u64, !ask || committed(s.memory, s.title_bytes)))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1776,8 +1785,17 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let d = unsafe { texture.GetDesc() };
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
-    let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
-    let read = layout.bytes_from(first) as usize;
+    let drop = crate::resource::drop_levels(&desc);
+    // Fixed dropping uploads every retained level. The original layout
+    // still locates the packed tail and preserves each array slice's stride
+    // (fxceless #610).
+    let (first, read, title_bytes) = if drop > 0 {
+        (level0, layout.bytes_from(level0) as usize, layout.size as usize)
+    } else {
+        let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
+        let read = layout.bytes_from(first) as usize;
+        (first, read, read)
+    };
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         mips - first
     } else {
@@ -1829,6 +1847,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         first,
         level0,
         read,
+        title_bytes,
         serial: copy.serial,
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
@@ -1885,6 +1904,43 @@ mod title_memory_tests {
                 assert!(bytes[HEAD..].iter().all(|&b| b == 0));
             });
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn retained_source_detiles_from_the_original_layout() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_S] {
+            let title = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 512,
+                height: 512,
+                depth: 1,
+                mips: 10,
+                element_bytes: 16,
+                block: 4,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let bytes: Vec<_> = (0..title.size)
+                .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+                .collect();
+            for drop in [1, 2, 4] {
+                let size = title.bytes_from(drop) as usize;
+                assert!(size < bytes.len());
+                for mip in drop..title.desc.mips {
+                    let m = &title.mips[mip as usize];
+                    let pitch = (m.width * title.desc.element_bytes) as usize;
+                    let len = pitch * m.height as usize;
+                    let mut expected = vec![0; len];
+                    let mut actual = vec![0; len];
+                    title.detile(&bytes, mip, 0, &mut expected, pitch, len).unwrap();
+                    title.detile(&bytes[..size], mip, 0, &mut actual, pitch, len).unwrap();
+                    assert_eq!(actual, expected, "{swizzle:?}, dropped {drop}, title mip {mip}");
+                }
+            }
         }
     }
 

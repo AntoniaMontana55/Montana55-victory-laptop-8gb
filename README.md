@@ -94,6 +94,7 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   blocks that rest, places in the title's code that look before they write.
 - **Textures go up on a copy queue of their own** and a slot shows one only after
   its upload ran, which also ended a device loss that came every 15 minutes or so.
+- **Texture mip dropping** (`VICTORY_TEXTURE_DROP_MIPS=N`, off by default) saves host VRAM on eligible title-filled 2D textures by omitting up to four of their largest levels (fxceless #610).
 - **Boats float**: textures that shaders write and the title's CPU reads go back
   to title memory (from fxceless and Geckomacabre, on by default here).
 - **Frame record and replay** with per-pass times and shader variants compared

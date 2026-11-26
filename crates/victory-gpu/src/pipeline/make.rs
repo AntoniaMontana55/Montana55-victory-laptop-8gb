@@ -43,6 +43,43 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Why this pipeline is left out on purpose ([`left_out`]).
+    left_out: Option<&'static str>,
+}
+
+/// Whether a compute shader's container names `name`.
+fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// (cool_fox 8cc31ab3, opt-in here) With the structure builder off the
+/// title's ray-tracing structures are never built, so its ray work walks
+/// stale memory on the card for nothing. `VICTORY_RT_SKIP_RESOLVE=1` leaves
+/// out the `CS_RaytracingResolve` pipelines (about a thousand) and
+/// `VICTORY_RT_SKIP_ACTIVATE=1` the `CS_ScreenProbes_ActivateRays` ones:
+/// their dispatches are dropped. Never with `VICTORY_BVH_BUILDER=1`.
+fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static SKIP: OnceLock<(bool, bool)> = OnceLock::new();
+    let (resolve, activate) = *SKIP.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        if on("VICTORY_BVH_BUILDER") {
+            return (false, false);
+        }
+        let skip = (on("VICTORY_RT_SKIP_RESOLVE"), on("VICTORY_RT_SKIP_ACTIVATE"));
+        if skip.0 || skip.1 {
+            tracing::info!(resolve = skip.0, activate = skip.1, "ray-tracing pipelines left out (no structures built)");
+        }
+        skip
+    });
+    if resolve && named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray hits without structures");
+    }
+    if activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("activates rays without structures");
+    }
+    None
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -61,6 +98,7 @@ impl Pending {
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            left_out: left_out(&shaders),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -159,6 +197,9 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if p.left_out.is_some() {
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -174,6 +215,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if p.left_out.is_some() {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -181,6 +225,9 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.left_out.is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);

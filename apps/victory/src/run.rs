@@ -106,6 +106,24 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    // Which D3D12 runtime this exe asks for (Windows 10 needs the Agility
+    // SDK's: `agility.rs`, `build.rs`).
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|e| Some(e.parent()?.join("D3D12").join("D3D12Core.dll")))
+        .is_some_and(|p| p.exists());
+    println!(
+        "d3d12 sdk      {}",
+        match (cfg!(agility), beside) {
+            (true, true) => format!(
+                "Agility {} from D3D12\\ beside the exe (for Windows 10)",
+                crate::agility::D3D12SDKVersion
+            ),
+            (false, true) => "D3D12\\D3D12Core.dll is beside the exe but this build has no Agility exports: build again".into(),
+            (true, false) => "Agility exports but no D3D12\\D3D12Core.dll beside the exe: the device will fail".into(),
+            (false, false) => "the system's own (Windows 11; on Windows 10 see the README)".into(),
+        }
+    );
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
