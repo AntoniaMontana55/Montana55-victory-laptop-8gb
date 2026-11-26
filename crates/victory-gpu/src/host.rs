@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -409,6 +409,61 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Free physical RAM under which the pools kept for speed are let go
+/// (`VICTORY_RAM_TRIM_MB`, in MiB; unset or 0: never, as before). On a PC
+/// of 16 GB the free RAM sat at 0.02-0.10 GB in every run and frames
+/// stood 1.8-5.4 s while the kernel paged (26.11, after fxceless #1240,
+/// which trims the same pools on Proton with 16 GB).
+fn ram_trim_bytes() -> u64 {
+    static AT: OnceLock<u64> = OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("VICTORY_RAM_TRIM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// Free RAM was under [`ram_trim_bytes`] at the last sweep: the pools are
+/// not filled again until it is not ([`ram_short`]).
+static RAM_SHORT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the PC is short of RAM ([`ram_trim_bytes`]): pools for speed
+/// keep nothing (snapshots, scratch chunks) or little (idle host lists).
+pub(crate) fn ram_short() -> bool {
+    RAM_SHORT.load(Ordering::Relaxed)
+}
+
+/// Lets go of the pools kept for speed (the PC is short of RAM): kept
+/// snapshot buffers, scratch chunks no list holds, idle host lists past
+/// [`crate::list::IDLE_WHEN_SHORT`].
+fn trim_pools() {
+    static FREED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static TOLD: AtomicU64 = AtomicU64::new(0);
+    let snapshots = crate::shadow::trim_pool();
+    let gone = std::mem::replace(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()), Spare::new());
+    let scratch = gone.bytes;
+    for (_, size) in &gone.kept {
+        ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[2].fetch_sub(*size, Ordering::Relaxed);
+        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+        ALIVE[4].fetch_sub(*size, Ordering::Relaxed);
+    }
+    drop(gone);
+    let lists = crate::list::trim_idle();
+    for (total, n) in FREED.iter().zip([snapshots, scratch, lists]) {
+        total.fetch_add(n, Ordering::Relaxed);
+    }
+    let now = now_ms();
+    if now >= TOLD.load(Ordering::Relaxed) + 10_000 {
+        TOLD.store(now, Ordering::Relaxed);
+        let [s, c, l] = FREED.each_ref().map(|f| f.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            snapshot_mb = s >> 20,
+            scratch_mb = c >> 20,
+            idle_lists = l,
+            "short of RAM (VICTORY_RAM_TRIM_MB): pools let go in the last 10 s"
+        );
+    }
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -423,12 +478,22 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    // Short of RAM: twice a second, and the pools kept for speed go too.
+    let every = if ram_short() { 500 } else { 1000 };
+    if now < last + every
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
         return;
+    }
+    let trim = ram_trim_bytes();
+    if trim > 0 {
+        let short = available_physical_ram().is_some_and(|free| free < trim);
+        RAM_SHORT.store(short, Ordering::Relaxed);
+        if short {
+            trim_pools();
+        }
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
@@ -1914,7 +1979,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
+            let back = if scratch_pool() && !ram_short() {
                 spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
             } else {
                 Some(chunk)

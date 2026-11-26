@@ -1311,6 +1311,10 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    // Short of RAM (`VICTORY_RAM_TRIM_MB`): none kept.
+    if crate::host::ram_short() {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1326,6 +1330,14 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// Lets every kept snapshot buffer go (the PC is short of RAM,
+/// `crate::host::ram_short`); the bytes they reserved.
+pub(crate) fn trim_pool() -> u64 {
+    let gone = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+    // (Given back to the kernel without the lock.)
+    gone.iter().map(|v| v.capacity() as u64).sum()
 }
 
 const NOT_WATCHED: u8 = 2;

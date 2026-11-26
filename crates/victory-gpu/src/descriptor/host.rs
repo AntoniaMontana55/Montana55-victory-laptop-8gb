@@ -1437,7 +1437,20 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // A heap capped at a million views (NVIDIA): `VICTORY_DYNAMIC_SLOTS`
+        // takes more of them from the title's slots kept in place (a table
+        // past those is made afresh here anyway), at most half the heap.
+        // With 2^18 the prison cell refused 700-1,171 of some 11,000 tables
+        // a frame, each a dropped draw (26.11; after trustno1-coder a9632bc8).
+        static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *CAPPED.get_or_init(|| {
+            let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, null / 2);
+            if slots != DYNAMIC {
+                tracing::info!(slots, title_in_place = null - slots, "dynamic view slots on a heap capped at a million");
+            }
+            slots
+        });
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
