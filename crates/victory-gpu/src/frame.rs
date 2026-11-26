@@ -39,6 +39,28 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Optional frame-rate cap override for console 25/30 FPS pacing:
+/// - `VICTORY_MAX_FPS=0` or `VICTORY_UNLOCK_FPS=1`: ticks at 1,000 Hz (1 ms).
+/// - `VICTORY_MAX_FPS=<N>` (N >= 1): caps interval to `1_000_000 / N` us.
+fn max_interval_override() -> Option<Duration> {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        if let Ok(raw) = std::env::var("VICTORY_MAX_FPS")
+            && let Ok(fps) = raw.trim().parse::<u64>()
+        {
+            return Some(if fps == 0 {
+                Duration::from_micros(1_000)
+            } else {
+                Duration::from_micros((1_000_000 / fps).max(1_000))
+            });
+        }
+        if std::env::var_os("VICTORY_UNLOCK_FPS").is_some_and(|v| v == "1") {
+            return Some(Duration::from_micros(1_000));
+        }
+        None
+    })
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,9 +71,16 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let requested = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
+    };
+    let interval = match max_interval_override() {
+        Some(cap) if requested > cap => {
+            tracing::info!(?requested, ?cap, "frame interval unlocked/capped");
+            cap
+        }
+        _ => requested,
     };
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.

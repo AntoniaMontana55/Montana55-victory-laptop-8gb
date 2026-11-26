@@ -1167,8 +1167,8 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
-    /// The title's level its level 0 is ([`held_only`] or [`drop_levels`]):
-    /// larger levels have no place in it.
+    /// The title's level its level 0 is ([`held_only`]): larger levels have
+    /// no place in it.
     pub(crate) base: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
@@ -1345,7 +1345,7 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     }
     let r = resource(this);
-    if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) || drop_levels(&r.desc) > 0 {
+    if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -1497,99 +1497,6 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
-/// How many of its largest levels the host copy of a texture described by
-/// `desc` leaves out (`VICTORY_TEXTURE_DROP_MIPS=N`, at most 4; 0, the
-/// default, leaves out none) (fxceless #610). Each level left out divides
-/// the texture's bytes by about four. Only 2D textures the
-/// title fills ([`fills`]), arrays and cubes included, at least 512 texels
-/// on their shorter side, whose sides the levels left out halve exactly
-/// into whole 4-texel blocks: host level `m` is then title level `m + N`
-/// texel for texel. Shaders see the texture at half the size per level
-/// left out. Views and copies translate the title's levels to host levels.
-#[cfg(windows)]
-pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
-    const TEXTURE_2D: u32 = 3;
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let n = *N.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
-            .min(4)
-    });
-    if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
-        return 0;
-    }
-    let n = n.min(u32::from(desc.mip_levels).saturating_sub(1));
-    let (w, h) = (desc.width, u64::from(desc.height));
-    let whole = |side: u64| side % (4 << n) == 0;
-    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
-        return 0;
-    }
-    n
-}
-
-/// [`drop_levels`] of title resource `this`; 0 for buffers and null.
-#[cfg(windows)]
-pub(crate) fn dropped(this: This) -> u32 {
-    if this.is_null() {
-        return 0;
-    }
-    drop_levels(&resource(this).desc)
-}
-
-/// The host copy's subresource for subresource `index` of title texture
-/// `this`, whose host copy leaves out [`dropped`] levels: `None` for a
-/// level it leaves out.
-#[cfg(windows)]
-pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
-    host_subresource_from(this, index, dropped(this))
-}
-
-/// The other side of a mip-dropping copy can have a view-driven base.
-#[cfg(windows)]
-pub(crate) fn copy_base(
-    this: This,
-    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) -> u32 {
-    // SAFETY: a live texture. Use the resource the copy actually names.
-    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
-    u32::from(resource(this).desc.mip_levels.saturating_sub(host_mips))
-}
-
-/// The host index when the copy begins at a known title level.
-#[cfg(windows)]
-pub(crate) fn host_subresource_from(this: This, index: u32, base: u32) -> Option<u32> {
-    if base == 0 {
-        return Some(index);
-    }
-    let mips = u32::from(resource(this).desc.mip_levels).max(1);
-    let (mip, slice) = (index % mips, index / mips);
-    (mip >= base && index < title_subresources(this))
-        .then(|| mip - base + slice * (mips - base))
-}
-
-/// Subresources in the first plane of title texture `this`, as the title
-/// numbers them (levels times slices).
-#[cfg(windows)]
-pub(crate) fn title_subresources(this: This) -> u32 {
-    let desc = &resource(this).desc;
-    u32::from(desc.mip_levels).max(1) * u32::from(desc.depth_or_array_size).max(1)
-}
-
-/// Maps a readback before creating a host texture. Ordinary textures keep
-/// their native subresource numbering. Shrunken textures support plane zero.
-#[cfg(windows)]
-pub(crate) fn readback_subresource(this: This, index: u32) -> Result<u32, &'static str> {
-    if dropped(this) == 0 {
-        return Ok(index);
-    }
-    if index >= title_subresources(this) {
-        return Err("a read back outside the first plane of the host texture");
-    }
-    host_subresource(this, index).ok_or("a mip level omitted from the host texture")
-}
-
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1639,9 +1546,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         const TEXTURE_2D: u32 = 3;
         let mut tiled = None;
         let mut texture = None;
-        let drop = drop_levels(&r.desc);
-        let shape_fits = drop == 0
-            && fills(&r.desc)
+        let shape_fits = fills(&r.desc)
             && r.desc.dimension == TEXTURE_2D
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
@@ -1669,10 +1574,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        // Fixed mip dropping takes precedence over the view-driven base.
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
-        let mut base = drop;
+        let mut base = 0;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
@@ -1708,7 +1612,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         };
         host.base = base;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
-        if base > 0 && drop == 0 {
+        if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
@@ -1822,10 +1726,16 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+        if let Some(mb) = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+        {
+            return mb.min(8192) << 20;
+        }
+        match crate::host::host().and_then(|h| h.video_memory()) {
+            Some([budget, ..]) if budget > 0 => (budget / 100 * 35).clamp(1024 << 20, 3072 << 20),
+            _ => 3072 << 20,
+        }
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));

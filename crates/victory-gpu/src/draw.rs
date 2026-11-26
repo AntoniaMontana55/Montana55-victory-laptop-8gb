@@ -66,14 +66,6 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-    /// While a stage's tables are walked: the table entries its shader may
-    /// write through (`HostShader::written_tables`, as a pointer and length
-    /// into the stage's translation, which outlives the walk); `None`: any.
-    static TABLE_WRITES: std::cell::Cell<Option<(*const (u8, u32), usize)>> =
-        const { std::cell::Cell::new(None) };
-    /// While one table entry is made readable: whether the shader may write
-    /// through it ([`entry_may_write`]).
-    static ENTRY_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -159,41 +151,6 @@ pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), Ato
 fn write_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
-}
-
-/// Whether a table entry's unordered access view is given to shaders as
-/// written only if the shader's code writes through that entry (the
-/// translator notes which, `HostShader::written_tables`), not whenever it
-/// stores to any buffer. The title binds tables whose shaders store through
-/// one view and only read the rest: 240 MB a frame compared back with no
-/// piece found changed (prison cell, 26.11). On by default;
-/// `VICTORY_TABLE_WRITES_PRECISE=0` declares every entry of a storing
-/// shader, as before.
-fn table_writes_precise() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_WRITES_PRECISE").is_none_or(|v| v != "0"))
-}
-
-/// Whether the stage whose tables are walked may write through entry `u`.
-fn entry_may_write(u: &UsedResource) -> bool {
-    if !table_writes_precise() {
-        return true;
-    }
-    match TABLE_WRITES.get() {
-        None => true,
-        // SAFETY: set by `State::bind` from the stage's translation, which it
-        // holds for the whole walk, and cleared before that ends.
-        Some((at, len)) => unsafe { std::slice::from_raw_parts(at, len) }
-            .contains(&(u.user_data, u.table_offset_dwords)),
-    }
-}
-
-/// [`readable`] for a table entry: declared written only if the shader may
-/// write through it.
-fn readable_entry(list: &HostList, u: &UsedResource, view: &View) {
-    ENTRY_WRITES.set(entry_may_write(u));
-    readable(list, u.kind, view);
-    ENTRY_WRITES.set(true);
 }
 
 /// A run of indirect records clamped in one pass ([`windows`]): the host
@@ -1533,12 +1490,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            TABLE_WRITES.set(t.host.written_tables.as_ref().map(|w| (w.as_ptr(), w.len())));
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
-            TABLE_WRITES.set(None);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2720,7 +2675,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        self.buffers_written(list);
+        self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -3056,9 +3011,8 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    let p = crate::pipeline::host_pipeline(self.pipeline as This);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = p {
+                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3066,16 +3020,9 @@ impl State {
                     if x > 65_535 {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
-                    // With the launch stage the count goes to it as a root
-                    // constant (`crate::launch`).
-                    match p.and_then(|p| p.launch.as_ref()) {
-                        Some(launch) => {
-                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
-                        }
-                        // SAFETY: an open list with everything set.
-                        None => unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) },
-                    }
-                    self.drew(list, p);
+                    // SAFETY: an open list with everything set.
+                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3177,7 +3124,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable_entry(list, u, &view);
+            readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3320,7 +3267,7 @@ impl State {
                 for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable_entry(list, u, &view);
+                        readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -3565,7 +3512,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3670,7 +3617,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -3684,26 +3631,23 @@ impl State {
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
-    fn buffers_written(&mut self, list: &HostList) {
-        list.gather_close();
+    fn buffers_written(&mut self) {
         match &mut self.batch {
-            Some(batch) if batches() == 2 && !crate::indirect::gather_enabled() => batch.wrote = true,
+            Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
         }
     }
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
+    fn drew(&mut self, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
-            list.gather_close();
             self.batch = None;
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
-    pub(crate) fn copied(&mut self, list: &HostList) {
-        list.gather_close();
+    pub(crate) fn copied(&mut self) {
         self.window = None;
         self.batch = None;
     }
@@ -3841,83 +3785,13 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One mesh record of a pipeline with the launch stage: the draw
-        // reads it itself (`crate::launch`), no clamp of ours before it.
-        if kind == MESH
-            && max == 1
-            && count.is_none()
-            && let Some(launch) = &p.launch
-        {
-            let offset = args.offset(arguments);
-            if !offset.is_multiple_of(4) {
-                why("a mesh record not 4-byte aligned");
-                return false;
-            }
-            if crate::indirect::gather_enabled() {
-                list.gather_close();
-                self.batch = None;
-            }
-            self.window = None;
-            args.refresh(list, arguments, len);
-            if !self.prepare_for(list, false, true) {
-                why("prepare failed");
-                return false;
-            }
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| {
-                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} launched"), false)
-            });
-            #[cfg(feature = "diagnostics")]
-            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
-            // SAFETY: a live buffer.
-            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
-            list.keep(&args.buffer);
-            self.mesh_scissor(list, true);
-            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
-            self.mesh_scissor(list, false);
-            if !launched {
-                why("no budget for the launch");
-                return false;
-            }
-            self.drew(list, Some(p));
-            DRAWN.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        let offset = args.offset(arguments);
-        let gather = crate::indirect::gather_enabled();
-        let gatherable = gather && kind != DISPATCH && max == 1 && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores)
-            && stride.is_multiple_of(4)
-            && crate::indirect::batch::words(kind).is_some_and(|words| {
-                let bytes = words * 4;
-                stride >= bytes && offset.is_multiple_of(4)
-                    && offset <= u64::from(u32::MAX - bytes)
-            });
-        let gathered = if gatherable {
-            args.refresh(list, arguments, len);
-            list.gather_slot((args.id(), &args.buffer), || argument_copies(&args), offset, kind)
-        } else {
-            None
-        };
-        if gather && gathered.is_none() {
-            list.gather_close();
-        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if gathered.is_some() {
-            gathered
-        } else if (if gatherable { crate::indirect::gather_runs() } else { batches() > 0 })
-            && max == 1 && count.is_none()
-        {
-            if !gatherable {
-                args.refresh(list, arguments, len);
-            }
+        let batch = if batches() > 0 && max == 1 && count.is_none() {
+            args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
             None
         };
-        if gather && (!gatherable || batch.is_none()) {
-            self.batch = None;
-        }
         if batch.is_some() {
             self.window = None;
         }
@@ -3926,6 +3800,7 @@ impl State {
         // buffer. Anything else ends the window: it uses the scratch buffer
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
+        let offset = args.offset(arguments);
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -4011,21 +3886,6 @@ impl State {
             why("prepare failed");
             return false;
         }
-        // A mesh call the launch stage does not take (a count buffer, more
-        // than one record): the same pipeline without the stage.
-        if kind == MESH
-            && let Some(launch) = &p.launch
-        {
-            let Some(plain) = launch.plain() else {
-                why("no host pipeline without the launch stage");
-                return false;
-            };
-            // SAFETY: an open list and a live pipeline of the same root
-            // signature.
-            unsafe { list.list.SetPipelineState(plain) };
-            self.host_pipeline = windows::core::Interface::as_raw(plain) as usize;
-            list.keep(plain);
-        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -4051,9 +3911,9 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written(list);
+            self.buffers_written();
         } else {
-            self.drew(list, Some(p));
+            self.drew(Some(p));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -4270,7 +4130,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() && ENTRY_WRITES.get() || !write_skip() {
+            if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
                 shadow.gpu_writes(list, address, len);

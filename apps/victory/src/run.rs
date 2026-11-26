@@ -106,8 +106,6 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    // Which D3D12 runtime this exe asks for (Windows 10 needs the Agility
-    // SDK's: `agility.rs`, `build.rs`).
     let beside = std::env::current_exe()
         .ok()
         .and_then(|e| Some(e.parent()?.join("D3D12").join("D3D12Core.dll")))
@@ -147,7 +145,7 @@ pub fn run(
         );
         println!("missing dlls   {message}");
         // None of their imports can be bound, so the title stops at its first
-        // call into one (the title 1.0.2.1 at +0x2237178 during
+        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
         // System Init, #930) with nothing saying why. Stubs only if asked for.
         if execute && matches!(unimplemented, Unimplemented::Trap) {
             anyhow::bail!(
@@ -185,6 +183,19 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+    }
+    // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
+    // descriptor records tell the layer their slots.
+    #[cfg(windows)]
+    if execute && victory_hle::port_descriptors::on() {
+        use victory_loader::descriptor_sites::{Hooked, SITES, apply};
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and the
+        // marks are a static.
+        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
+        let patched = done.iter().filter(|d| **d == Hooked::Done).count();
+        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
+        victory_hle::port_descriptors::hooked(image.base(), size, patched);
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -273,7 +284,7 @@ fn watch(base: usize, size: usize) {
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (the title: 30 s) runs on
+/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
 /// through slower frames with its tick flag poked. The address must be
 /// writable title data.
 #[cfg(all(windows, feature = "diagnostics"))]

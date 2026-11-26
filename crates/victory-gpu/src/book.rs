@@ -44,8 +44,6 @@ struct Entry {
     made: u64,
     /// What was told of it since ([`note`]).
     notes: String,
-    /// (Local) Where its memory is ([`heap_kind`]), for [`owners`].
-    heap: &'static str,
 }
 
 #[derive(Default)]
@@ -100,7 +98,7 @@ impl Book {
         if size > LONG {
             self.long.push(id);
         }
-        self.live.insert(id, Entry { start, size, what, made: now, notes: String::new(), heap: "?" });
+        self.live.insert(id, Entry { start, size, what, made: now, notes: String::new() });
         if object != 0 {
             self.by_object.insert(object, id);
         }
@@ -244,6 +242,17 @@ fn viewable(format: i32) -> Option<i32> {
     })
 }
 
+/// The address of `texture` as its descriptor has it (its first level's),
+/// if the book is kept.
+pub(crate) fn address(texture: &ID3D12Resource) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    texture_address(texture, &desc)
+}
+
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
     struct Slot(ID3D12DescriptorHeap, usize);
@@ -331,87 +340,8 @@ pub(crate) fn made(resource: &ID3D12Resource, what: impl FnOnce() -> String) {
     };
     let what = what();
     let now = crate::host::now_ms();
-    let heap = heap_kind(resource);
-    let id = with(|b| {
-        let id = b.add(raw, start, size.max(1), what, now);
-        if let Some(e) = b.live.get_mut(&id) {
-            e.heap = heap;
-        }
-        id
-    });
+    let id = with(|b| b.add(raw, start, size.max(1), what, now));
     watch(&object, id);
-}
-
-/// (Local) Where a resource's memory is, by its heap's properties: the PC's
-/// memory (what the system counts as shared with the card) or the card's.
-fn heap_kind(resource: &ID3D12Resource) -> &'static str {
-    let mut props = D3D12_HEAP_PROPERTIES::default();
-    let mut flags = D3D12_HEAP_FLAGS::default();
-    // SAFETY: a live resource; plain out pointers.
-    if unsafe { resource.GetHeapProperties(Some(&mut props as *mut _), Some(&mut flags as *mut _)) }.is_err() {
-        return "reserved";
-    }
-    match props.Type {
-        D3D12_HEAP_TYPE_UPLOAD => "PC: upload",
-        D3D12_HEAP_TYPE_READBACK => "PC: readback",
-        D3D12_HEAP_TYPE_DEFAULT => "card",
-        D3D12_HEAP_TYPE_GPU_UPLOAD => "card, CPU-mapped",
-        D3D12_HEAP_TYPE_CUSTOM if props.MemoryPoolPreference == D3D12_MEMORY_POOL_L0 => "PC: custom",
-        D3D12_HEAP_TYPE_CUSTOM => "card: custom",
-        _ => "other",
-    }
-}
-
-/// `what` with its numbers made one sign, so that the same kind of thing
-/// counts together ("title memory 0x1234+0x40000" → "title memory #+#").
-fn kind_of_name(what: &str) -> String {
-    let mut out = String::with_capacity(what.len());
-    let mut chars = what.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_ascii_digit() {
-            if c == '0' && matches!(chars.peek(), Some('x')) {
-                chars.next();
-            }
-            while chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
-                chars.next();
-            }
-            out.push('#');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// (Local) Who holds memory now, by where it is and what it is: one line a
-/// place with its total, then the `most` biggest kinds.
-pub(crate) fn owners(most: usize) -> Vec<String> {
-    if !on() {
-        return Vec::new();
-    }
-    let (places, kinds) = with(|b| {
-        let mut places: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
-        let mut kinds: HashMap<(&'static str, String), (u64, u64)> = HashMap::new();
-        for e in b.live.values() {
-            let p = places.entry(e.heap).or_default();
-            p.0 += 1;
-            p.1 += e.size;
-            let k = kinds.entry((e.heap, kind_of_name(&e.what))).or_default();
-            k.0 += 1;
-            k.1 += e.size;
-        }
-        (places, kinds)
-    });
-    let mut lines: Vec<String> = places
-        .iter()
-        .map(|(place, (n, bytes))| format!("owners, {place}: {n} alive {} MB", bytes >> 20))
-        .collect();
-    let mut kinds: Vec<_> = kinds.into_iter().collect();
-    kinds.sort_by(|a, b| b.1.1.cmp(&a.1.1));
-    for ((place, what), (n, bytes)) in kinds.into_iter().take(most) {
-        lines.push(format!("owners,   [{place}] {what}: {n} alive {} MB", bytes >> 20));
-    }
-    lines
 }
 
 /// A block of texture memory, found by the texture `resource` at `offset` of it.

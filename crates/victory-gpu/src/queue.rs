@@ -684,8 +684,7 @@ fn present_planes(count: u32, parameters: *const Plane) -> Option<(Vec<crate::ho
     if !enabled {
         return None;
     }
-    // SAFETY: a multi-plane Present passes count descriptions in the
-    // Series S ABI. Their lists and optional rectangles live through this call.
+    // SAFETY: a multi-plane Present passes count descriptions in the Series S ABI.
     let descriptions = unsafe {
         std::slice::from_raw_parts(parameters.cast::<PlaneDescription>(), count as usize)
     };
@@ -709,7 +708,6 @@ fn present_planes(count: u32, parameters: *const Plane) -> Option<(Vec<crate::ho
     }
     Some((planes, premultiplied))
 }
-
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -909,7 +907,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the title's planes in our window.
+/// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -1021,7 +1019,11 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, behind::Present::Copy(texture.map(|(_, copy, state)| (copy, state))), Shown { frame, resource });
+        behind::present(
+            this,
+            behind::Present::Copy(texture.map(|(_, copy, state)| (copy, state))),
+            Shown { frame, resource },
+        );
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -1063,6 +1065,12 @@ fn frame_ends() {
             behind::leave();
         }
     });
+    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
 }
 
 /// The frame a present shows, and the title's resource it shows.

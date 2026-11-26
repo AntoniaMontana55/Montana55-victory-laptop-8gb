@@ -662,8 +662,11 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
+        let read = copied_read(&copies, runs);
+        looked.end();
+        let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)
@@ -909,6 +912,18 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if r.iter().any(|&n| n > 0.0) {
+            tracing::info!(
+                "what a copy at its place writes, found read on the CPU behind it, per frame (looks, all threads): {:.2} by \
+                 another such copy, {:.2} by a buffer copy, {:.2} by a fill, {:.2} by a texture, {:.2} by a step of ours",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4]
+            );
+        }
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let mut noted: Vec<_> = noted.into_iter().collect();
         noted.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.0));
@@ -1264,7 +1279,7 @@ mod tests {
                     .ResourceBarrier(&[transition(&first.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
             }
             a.close();
-            host.execute_own(&a, || {});
+            host.execute_own(&a);
             // With the flight in the air, beside what it writes.
             for (i, b) in title[5300..5400].iter_mut().enumerate() {
                 *b = seed(1300 + i) ^ 0x5c;
@@ -1285,12 +1300,12 @@ mod tests {
             b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
-            host.execute_own(&b, || {});
+            host.execute_own(&b);
             // What the first wrote, read by the next submission.
             let c = host.new_list().unwrap();
             c.defer_copy((start + 1_200_000) as *mut u8, (start + HALF + 100) as *const u8, 1500);
             c.close();
-            let number = host.execute_own(&c, || {});
+            let number = host.execute_own(&c);
             settle_now(WHY_SYNC);
             assert!(FINISHED.load(Ordering::Acquire) >= number);
             let wanted: Vec<u8> = (0..2000)

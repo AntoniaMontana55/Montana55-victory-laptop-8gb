@@ -1,23 +1,20 @@
-//! The run's numbers on the picture: F9 (or F3) shows and hides it while
-//! our window has the focus, `VICTORY_PANEL=1` shows it from the start. Text
-//! on a black box in the upper left corner of what is shown, so that a
+//! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
+//! default; F3 shows and hides it while our window has the focus): white
+//! text on a black box in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
-//! thread, and under it the times of the last frames as bars (green up to
-//! 30 frames a second, yellow up to 15, red slower) with lines at 30 and 10.
-//! Made again twice a second from the counters of the frame-rate line,
-//! memory, shaders and pipelines; a frame itself only copies the box out of
-//! a buffer in the card's memory. Copied onto the swap chain's buffer,
-//! behind the title's picture: saved frames and the frame recorder see the
-//! title's own. Hidden, nothing is read or drawn but the keys.
+//! thread. Made again twice a second from the counters of
+//! the frame-rate line, memory and textures; a frame itself only copies the
+//! box out of a buffer in the card's memory. Copied onto the swap chain's
+//! buffer, behind the title's picture: saved frames and the frame recorder
+//! see the title's own.
 
-use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F9};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
@@ -30,45 +27,8 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 12;
+const LINES: u32 = 9;
 const RIM: u32 = 3;
-/// The graph under the lines: its height in dots, the dots between it and
-/// the text, a bar's width in dots, and what a dot of height stands for.
-const GRAPH: u32 = 32;
-const GAP: u32 = 2;
-const BAR: u32 = 2;
-const BARS: usize = (COLUMNS * CELL.0 / BAR) as usize;
-const MS_A_DOT: f32 = 200.0 / GRAPH as f32;
-/// Frame times with a line across the graph: 30 and 10 frames a second.
-const GUIDES: [f32; 2] = [1000.0 / 30.0, 100.0];
-
-/// The colours, by index.
-const BLACK: u8 = 0;
-const WHITE: u8 = 1;
-const GREEN: u8 = 2;
-const YELLOW: u8 = 3;
-const RED: u8 = 4;
-const GREY: u8 = 5;
-const DARK: u8 = 6;
-/// Red, green and blue of each, as written to an 8-bit picture.
-const PALETTE: [[f32; 3]; 7] = [
-    [0.0, 0.0, 0.0],
-    [1.0, 1.0, 1.0],
-    [0.3, 0.9, 0.35],
-    [1.0, 0.8, 0.15],
-    [1.0, 0.3, 0.25],
-    [0.5, 0.5, 0.5],
-    [0.12, 0.12, 0.12],
-];
-
-/// The colour of a frame of `ms`.
-fn tone(ms: f32) -> u8 {
-    match ms {
-        ..=34.0 => GREEN,
-        ..=67.0 => YELLOW,
-        _ => RED,
-    }
-}
 
 /// The texts are put into one of these in turn: the card reads the others,
 /// at most half a second old.
@@ -85,11 +45,11 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
-/// F9 or F3 was pressed since the last call, with one of our windows in front.
+/// F3 was pressed since the last call, with one of our windows in front.
 fn pressed() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
-    // SAFETY: plain queries.
-    let down = unsafe { GetAsyncKeyState(i32::from(VK_F9)) < 0 || GetAsyncKeyState(i32::from(VK_F3)) < 0 };
+    // SAFETY: a plain query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
     if DOWN.swap(down, Ordering::Relaxed) || !down {
         return false;
     }
@@ -149,7 +109,7 @@ const fn glyph(c: u8) -> [u8; 7] {
 
 /// The box's size in pixels, a dot being `scale` of them each way.
 const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + GAP + GRAPH + 2 * RIM) * scale)
+    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
 }
 
 /// Pixels to a dot for a picture that high: a 720-line screenshot of it
@@ -158,97 +118,43 @@ fn scale(height: u32) -> u32 {
     (height / 540).max(1)
 }
 
-/// What the box shows.
-#[derive(Default)]
-struct Picture {
-    lines: Vec<String>,
-    /// The first line's colour.
-    first: u8,
-    /// The last frames' times in milliseconds, the oldest first.
-    frames: Vec<f32>,
-}
-
-/// The colour of a dot of the box.
-fn dot(p: &Picture, x: u32, y: u32) -> u8 {
+/// Whether a dot of the picture of `lines` is white.
+fn lit(lines: &[String], x: u32, y: u32) -> bool {
     let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return BLACK;
+        return false;
     };
-    if x >= COLUMNS * CELL.0 {
-        return BLACK;
+    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
+        return false;
     }
-    if y < LINES * CELL.1 {
-        let line = (y / CELL.1) as usize;
-        if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 {
-            return BLACK;
-        }
-        let Some(&c) = p.lines.get(line).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-            return BLACK;
-        };
-        let lit = (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0;
-        return match (lit, line) {
-            (false, _) => BLACK,
-            (true, 0) => p.first,
-            (true, _) => WHITE,
-        };
-    }
-    let Some(y) = y.checked_sub(LINES * CELL.1 + GAP).filter(|&y| y < GRAPH) else {
-        return BLACK;
+    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
+        return false;
     };
-    // Dots up from the graph's floor.
-    let up = GRAPH - 1 - y;
-    let bar = (x / BAR) as usize;
-    let first = BARS.saturating_sub(p.frames.len());
-    if let Some(&ms) = bar.checked_sub(first).and_then(|i| p.frames.get(i)) {
-        if (up as f32) < (ms / MS_A_DOT).ceil() {
-            return tone(ms);
-        }
-    }
-    if x % 2 == 0 && GUIDES.iter().any(|&g| up == (g / MS_A_DOT).round() as u32) {
-        return GREY;
-    }
-    DARK
+    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
-/// Half of a float (no more than the palette needs: 0, and from 2^-14 up).
-fn half(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
-    if v <= 0.0 || exponent <= 0 {
-        return 0;
-    }
-    ((exponent as u32) << 10 | ((bits >> 13) & 0x3FF)) as u16
-}
-
-/// The bytes of a pixel of each colour of [`PALETTE`] in a swap chain's format.
-fn colours(format: DXGI_FORMAT) -> Option<Vec<Vec<u8>>> {
-    let unorm = |c: f32, max: f32| (c * max).round() as u32;
-    let pixel = |[r, g, b]: [f32; 3]| -> Option<Vec<u8>> {
-        Some(match format {
-            DXGI_FORMAT_R8G8B8A8_UNORM => vec![unorm(r, 255.0) as u8, unorm(g, 255.0) as u8, unorm(b, 255.0) as u8, 0xFF],
-            DXGI_FORMAT_B8G8R8A8_UNORM => vec![unorm(b, 255.0) as u8, unorm(g, 255.0) as u8, unorm(r, 255.0) as u8, 0xFF],
-            DXGI_FORMAT_R10G10B10A2_UNORM => {
-                (unorm(r, 1023.0) | unorm(g, 1023.0) << 10 | unorm(b, 1023.0) << 20 | 3 << 30).to_le_bytes().to_vec()
-            }
-            // Linear light: the palette's values are for a picture with its gamma.
-            DXGI_FORMAT_R16G16B16A16_FLOAT => [r, g, b, 1.0]
-                .into_iter()
-                .flat_map(|c| half(if c < 1.0 { c.powf(2.2) } else { c }).to_le_bytes())
-                .collect(),
-            _ => return None,
-        })
-    };
-    PALETTE.into_iter().map(pixel).collect()
+/// The bytes of a black and a white pixel of a swap chain's format.
+fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
+    Some(match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
+        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
+        // Halves of 0 and 1.
+        DXGI_FORMAT_R16G16B16A16_FLOAT => [
+            &[0, 0, 0, 0, 0, 0, 0, 0x3C],
+            &[0, 0x3C, 0, 0x3C, 0, 0x3C, 0, 0x3C],
+        ],
+        _ => return None,
+    })
 }
 
 /// The box as rows of `pitch` bytes.
-fn painted(p: &Picture, scale: u32, colours: &[Vec<u8>], pitch: usize) -> Vec<u8> {
+fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
     let (width, height) = size(scale);
     let bytes = colours[0].len();
     let mut out = vec![0; pitch * height as usize];
     for y in 0..height / scale {
         let top = pitch * (y * scale) as usize;
         for x in 0..width / scale {
-            let colour = &colours[usize::from(dot(p, x, y))];
+            let colour = colours[usize::from(lit(lines, x, y))];
             for i in 0..scale {
                 let at = top + (x * scale + i) as usize * bytes;
                 out[at..at + bytes].copy_from_slice(colour);
@@ -266,19 +172,7 @@ fn painted(p: &Picture, scale: u32, colours: &[Vec<u8>], pitch: usize) -> Vec<u8
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
-const COUNTERS: usize = 12;
-
-/// The time our threads ran, in 100 ns.
-fn cpu_time() -> u64 {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
-    let [created, ended, kernel, user] = &mut t;
-    // SAFETY: our own process and room for the answers.
-    unsafe { GetProcessTimes(GetCurrentProcess(), created, ended, kernel, user) };
-    let get = |f: &FILETIME| u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime);
-    get(&t[2]) + get(&t[3])
-}
+const COUNTERS: usize = 11;
 
 impl Counters {
     fn now() -> Counters {
@@ -297,7 +191,6 @@ impl Counters {
             crate::draw::dropped_now(),
             peek(C::RecordNs),
             crate::draw::drawn(),
-            cpu_time(),
         ])
     }
 
@@ -319,22 +212,16 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
-    let (cached, translated) = crate::shader_cache::counts();
-    let (made, failed) = crate::pipeline::made_and_failed();
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        // 100 ns of CPU time a frame over the frame's time.
-        format!("CPU {:.1} CORES  RECORDING {:.0} MS", c[11] / (ms.max(0.001) * 1e4), c[9] / 1e6),
-        format!("DRAWS {:.0}  DROPPED {:.0}  COPY BACK {:.1}", c[10], c[8], c[5] / 1e3),
-        format!("SHADERS {}  NEW {translated}", cached + translated),
-        format!("PIPELINES {made}  WAITING {}  FAILED {failed}", crate::pipeline::making()),
+        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
         format!("THIS PANEL {:.0} US A FRAME", cost),
-        format!("LAST {BARS} FRAMES  LINES AT 30 AND 10 FPS"),
     ]
 }
 
@@ -384,9 +271,9 @@ impl Buffers {
         Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
-    fn write(&mut self, p: &Picture) {
+    fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(p, self.scale, &colours, self.pitch as usize);
+        let picture = painted(lines, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -403,9 +290,7 @@ pub(super) struct Panel {
     /// What this took since the last text.
     cost: Duration,
     before: Counters,
-    /// The last frames' times, the oldest first.
-    times: VecDeque<f32>,
-    picture: Picture,
+    lines: Vec<String>,
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
@@ -421,8 +306,7 @@ impl Panel {
             worst: 0.0,
             cost: Duration::ZERO,
             before: Counters::default(),
-            times: VecDeque::with_capacity(BARS),
-            picture: Picture::default(),
+            lines: Vec::new(),
             changed: false,
             buffers: None,
             failed: false,
@@ -444,18 +328,10 @@ impl Panel {
             // (Shown from here on.)
             (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
             self.frames = 0;
-            self.times.clear();
         }
         self.frames += 1;
-        let ms = (now - self.last).as_secs_f64() * 1e3;
-        self.worst = self.worst.max(ms);
+        self.worst = self.worst.max((now - self.last).as_secs_f64() * 1e3);
         self.last = now;
-        if ms > 0.0 {
-            if self.times.len() == BARS {
-                self.times.pop_front();
-            }
-            self.times.push_back(ms as f32);
-        }
         let elapsed = now - self.since;
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
@@ -466,12 +342,7 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        let ms = elapsed.as_secs_f64() * 1e3 / frames;
-        self.picture = Picture {
-            lines: text(&c, ms, self.worst, cost, host),
-            first: tone(ms as f32),
-            frames: self.times.iter().copied().collect(),
-        };
+        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -487,7 +358,7 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
-        if !shown().load(Ordering::Relaxed) || self.picture.lines.is_empty() || self.failed {
+        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
             return;
         }
         let began = Instant::now();
@@ -503,7 +374,7 @@ impl Panel {
         }
         let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(&self.picture);
+            buffers.write(&self.lines);
         }
         let (w, h) = size(scale);
         let list = &list.list;
@@ -572,66 +443,24 @@ mod tests {
 
     #[test]
     fn a_box_is_painted() {
-        let p = Picture { lines: vec!["I".to_owned(), " i".to_owned()], first: RED, frames: Vec::new() };
+        let lines = vec!["I".to_owned(), " i".to_owned()];
         for scale in [1, 2, 4] {
             let (width, height) = size(scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;
             let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = painted(&p, scale, &colours, pitch);
+            let picture = painted(&lines, scale, colours, pitch);
             assert_eq!(picture.len(), pitch * height as usize);
             let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
-            let (black, white, red) = (&colours[0][..], &colours[1][..], &colours[usize::from(RED)][..]);
-            // The rim is black, the first letter's top row lit in its middle,
-            // in the first line's colour.
-            assert_eq!(at(0, 0), black);
-            assert_eq!(at((RIM + 2) * scale, RIM * scale), red);
-            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), red);
-            assert_eq!(at(RIM * scale, RIM * scale), black);
-            // Small letters are shown as capitals, a line and a cell on, in white.
-            assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), white);
+            // The rim is black, the first letter's top row lit in its middle.
+            assert_eq!(at(0, 0), colours[0]);
+            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[1]);
+            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[1]);
+            assert_eq!(at(RIM * scale, RIM * scale), colours[0]);
+            // Small letters are shown as capitals, a line and a cell on.
+            assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
             // Nothing past a line's end.
-            assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), black);
+            assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
         }
-    }
-
-    #[test]
-    fn frames_are_bars_from_the_right() {
-        let p = Picture { lines: Vec::new(), first: WHITE, frames: vec![20.0, 50.0, 400.0] };
-        let floor = RIM + LINES * CELL.1 + GAP + GRAPH - 1;
-        let right = RIM + COLUMNS * CELL.0 - 1;
-        // The newest frame is the rightmost bar, slower than 15 a second: red to the top.
-        assert_eq!(dot(&p, right, floor), RED);
-        assert_eq!(dot(&p, right, floor + 1 - GRAPH), RED);
-        assert_eq!(dot(&p, right - BAR, floor), YELLOW);
-        assert_eq!(dot(&p, right - 2 * BAR, floor), GREEN);
-        // 20 ms is four dots high.
-        assert_eq!(dot(&p, right - 2 * BAR, floor - 3), GREEN);
-        assert_ne!(dot(&p, right - 2 * BAR, floor - 4), GREEN);
-        // No frame there yet.
-        assert_eq!(dot(&p, RIM + 1, floor), DARK);
-        // The line at 30 a second, dotted.
-        let at30 = floor - (GUIDES[0] / MS_A_DOT).round() as u32;
-        assert_eq!(dot(&p, RIM, at30), GREY);
-        assert_eq!(dot(&p, RIM + 1, at30), DARK);
-    }
-
-    #[test]
-    fn colours_of_each_format() {
-        for format in [
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_FORMAT_R10G10B10A2_UNORM,
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-        ] {
-            let c = colours(format).unwrap();
-            assert_eq!(c.len(), PALETTE.len());
-            assert!(c.iter().all(|p| p.len() == c[0].len()));
-        }
-        let ten = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-        assert_eq!((&ten[0][..], &ten[1][..]), (&[0, 0, 0, 0xC0][..], &[0xFF; 4][..]));
-        assert_eq!(colours(DXGI_FORMAT_B8G8R8A8_UNORM).unwrap()[usize::from(RED)][2], 0xFF);
-        assert_eq!(colours(DXGI_FORMAT_R16G16B16A16_FLOAT).unwrap()[1], [0, 0x3C, 0, 0x3C, 0, 0x3C, 0, 0x3C]);
-        assert_eq!(half(0.5), 0x3800);
     }
 
     #[test]

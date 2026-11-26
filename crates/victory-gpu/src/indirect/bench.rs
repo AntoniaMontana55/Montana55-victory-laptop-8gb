@@ -304,9 +304,11 @@ fn bench_indirect_draw_barriers() {
             );
         }
         let (budget, budget_ptr) = host.shared_buffer(256).unwrap();
+        let budget_gpu = budget.GetGPUVirtualAddress();
         // The same words in the card's own memory (zeroed when made; the
         // runs below charge far less than the budget).
         let card_budget = host.uav_buffer(256).unwrap();
+        let card_budget_gpu = card_budget.GetGPUVirtualAddress();
         let scratch = host
             .uav_buffer(u64::from(WINDOW * STEP).max(64 << 10))
             .unwrap();
@@ -401,7 +403,7 @@ fn bench_indirect_draw_barriers() {
                     clamp,
                     &list,
                     (&scratch, state),
-                    if card { &card_budget } else { &budget },
+                    if card { card_budget_gpu } else { budget_gpu },
                     (&src, u64::from(first * STEP)),
                     None,
                     (0, STEP, records),

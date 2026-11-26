@@ -12,31 +12,6 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
-/// The bytes of payload a translated mesh shader declares and never reads
-/// when `VICTORY_MESH_LAUNCH=1`. The host puts an amplification shader of
-/// its own in front of it (`victory-gpu`'s `launch`), whose payload must
-/// have the size the mesh shader declares: a mesh shader that declares none
-/// is refused with one (the RTX 5080's driver returns `E_INVALIDARG`), and
-/// one that declares a payload is still taken without an amplification shader.
-pub const MESH_PAYLOAD_BYTES: u32 = 4;
-/// The register space the host's amplification shader binds in (`b0`,
-/// `t0`, `u0`): no translated shader binds there.
-pub const LAUNCH_SPACE: u32 = 9;
-
-/// Payload size (in bytes) declared by translated mesh shaders. Off by default
-/// (0 bytes, bit-for-bit identical to before); `VICTORY_MESH_LAUNCH=1` emits
-/// [`MESH_PAYLOAD_BYTES`] so the host's amplification shader can bound indirect
-/// mesh draws without a separate clamp compute pass (fablinoo/kelvaroq 32c4ab4fe9).
-pub fn mesh_launch_payload() -> u32 {
-    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        if std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1") {
-            MESH_PAYLOAD_BYTES
-        } else {
-            0
-        }
-    })
-}
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -57,8 +32,17 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
+/// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
+/// dwords per view heap slot, the title address of the buffer view (or
+/// ray-tracing structure) there, low 32 bits first; 0 for anything else.
+/// Read by a program that takes the address out of a descriptor it picks
+/// at a computed index and walks the memory behind it.
+pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Bytes of the whole [`SLOT_STRIDES`] buffer.
+pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -242,15 +226,6 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
-    /// Heap handles of views read from descriptor tables, with the used
-    /// resource they fall in as `(user_data, table_offset_dwords)`, or
-    /// `None` when that is not one entry (a view picked among several).
-    pub table_handles: std::collections::HashMap<V, Option<(u8, u32)>>,
-    /// The table entries an operation may write through ([`Shader::op`]).
-    pub written_tables: Vec<(u8, u32)>,
-    /// An operation may write through a table view whose entry is not
-    /// known: every table view the shader names must be taken as written.
-    pub written_tables_unknown: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -308,9 +283,6 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            table_handles: std::collections::HashMap::new(),
-            written_tables: Vec::new(),
-            written_tables_unknown: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -344,20 +316,6 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        // A table view is written by any operation on its handle that is not
-        // known to only read (loads, samples, gathers, sizes): stores,
-        // atomics, counters and operations to come count as writes.
-        const READS: [u32; 17] = [59, 60, 61, 62, 63, 64, 65, 66, 68, 71, 72, 73, 74, 81, 139, 222, 223];
-        if !READS.contains(&opcode)
-            && let Some(first) = args.first()
-            && let Some(entry) = self.table_handles.get(first)
-        {
-            match entry {
-                Some(e) if !self.written_tables.contains(e) => self.written_tables.push(*e),
-                Some(_) => {}
-                None => self.written_tables_unknown = true,
-            }
-        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -837,6 +795,11 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -877,7 +840,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        mesh_launch_payload(),
+                        0,
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

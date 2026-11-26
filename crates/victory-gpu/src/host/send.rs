@@ -119,19 +119,34 @@ unsafe impl Send for Memory {}
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
-/// (Local) `VICTORY_SEND_KEPT_MB` sets it (16 to 1024): upload memory is
-/// the PC's, locked while it stands (run b11: 21 of them alive, 464 MB, of
-/// a 3.7 GB lock on a 16 GB PC).
+/// `VICTORY_SEND_KEPT_MB` overrides (16 to 1024); otherwise scales automatically
+/// to 128 MiB on <=16 GB RAM hosts, 256 MiB on <=24 GB, and 768 MiB on 32+ GB.
 fn kept() -> u64 {
-    static MB: OnceLock<Option<u64>> = OnceLock::new();
-    let asked = *MB.get_or_init(|| {
-        std::env::var("VICTORY_SEND_KEPT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| (16..=1024).contains(mb))
-    });
-    match asked {
-        Some(mb) => mb << 20,
-        None if on_card() => 256 << 20,
-        None => 768 << 20,
-    }
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let asked = std::env::var("VICTORY_SEND_KEPT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|mb| (16..=1024).contains(mb));
+        match asked {
+            Some(mb) => mb << 20,
+            None if on_card() => 256 << 20,
+            None => match super::total_physical_ram() {
+                Some(ram) if ram <= (17u64 << 30) => 128 << 20,
+                Some(ram) if ram <= (25u64 << 30) => 256 << 20,
+                _ => 768 << 20,
+            },
+        }
+    })
+}
+
+/// Drops spare upload buffers held for reuse (called on RAM pressure).
+#[allow(dead_code)]
+pub(super) fn trim_spare() -> u64 {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    let freed: u64 = spare.iter().map(|m| m.size).sum();
+    spare.clear();
+    freed
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -195,6 +210,8 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    /// Bytes of memory used.
+    used: u64,
 }
 
 /// Runs whose pairs are one piece of work.
@@ -261,7 +278,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    Some(Own { memory, copies, used: at })
 }
 
 impl Own {
@@ -277,7 +294,10 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
+        from: Option<&ID3D12Resource>,
     ) {
+        // (With `crate::host::upq`: a copy of the memory in the card's.)
+        let source = from.unwrap_or(&self.memory.buffer);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -285,7 +305,7 @@ impl Own {
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -312,7 +332,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -331,6 +351,11 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
+    }
+
+    /// The memory and the bytes of it used.
+    pub(super) fn source(&self) -> (&ID3D12Resource, u64) {
+        (&self.memory.buffer, self.used)
     }
 
     /// The memory, to be kept until the submission has run.

@@ -55,9 +55,6 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
-    /// The table entries the shader may write through, or `None` if it may
-    /// write through one not known ([`HostShader::written_tables`]).
-    pub written_tables: Option<Vec<(u8, u32)>>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -1160,6 +1157,24 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     let before = FIRST_HALF_PAIRS.replace(true);
     let result = translate();
     FIRST_HALF_PAIRS.set(before);
+    result
+}
+
+thread_local! {
+    /// Whether a mask operation on numbers read as data is the number it
+    /// computes ([`with_mask_ops_on_numbers`]).
+    static MASK_OPS_ON_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with 32-bit scalar bit operations that structurisation
+/// took for lane masks, but whose operands are numbers, read as data as the
+/// numbers they compute (`Lower::mask_op_on_numbers`): the translation of a
+/// program refused with [`MASK_ELSEWHERE`] and only of such a program, so
+/// no program that translated without it changes.
+pub(super) fn with_mask_ops_on_numbers<R>(translate: impl FnOnce() -> R) -> R {
+    let before = MASK_OPS_ON_NUMBERS.replace(true);
+    let result = translate();
+    MASK_OPS_ON_NUMBERS.set(before);
     result
 }
 
@@ -2425,14 +2440,12 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
-        let written_tables = (!self.s.written_tables_unknown).then(|| self.s.written_tables.clone());
         Ok(Lowered {
             wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
-            written_tables,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3067,6 +3080,48 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// [`Self::view_address`] of a buffer view the program picks at an
+    /// index it computes, from a table or the heap: the view's title
+    /// address from the host's table by view heap slot
+    /// ([`super::shader::VIEW_ADDRESSES`], after the strides in
+    /// [`super::shader::SLOT_STRIDES`]), dword 0 its low 32 bits, dword 1
+    /// the rest. None for a load at a fixed place (that is
+    /// [`Self::view_address`]'s) or not of whole descriptors.
+    // shortcut: dword 1 holds the address bits only (a buffer's stride and
+    // swizzle bits read 0); the computed part of the offset is taken as
+    // whole descriptors (32-byte multiples), as `heap_index` does.
+    fn heap_view_address(&mut self, site: Site) -> Result<Option<(V, V)>, Why> {
+        use super::shader::{SLOT_STRIDES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
+        let Some(a) = self.scalar.get(&site).copied() else {
+            return Ok(None);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return Ok(None);
+        };
+        let picked = match rp.root {
+            RootType::ResourceHeap => true,
+            RootType::Table => a.dynamic.is_some(),
+            _ => false,
+        };
+        if !picked || a.offset % 32 != 0 {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false)?;
+        // Inside the table whatever the index: a root view has no bounds.
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let base = self.s.m.i32(VIEW_ADDRESSES);
+        let byte = self.s.m.bin(c, Bin::Add, byte, base);
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let words = self.raw_dwords(h, byte, 2);
+        Ok(Some((words[0], words[1])))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -3480,9 +3535,96 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The number a 32-bit scalar bit operation (`s_and_b32`, `s_or_b32`,
+    /// ...) that structurisation took for a lane mask computes, where its
+    /// operands are numbers: constants, root constants, values lowered as
+    /// numbers (a join of a mask and data, `phis`), or such operations
+    /// again. Computed in the current block, which their definitions
+    /// dominate. Only with console lanes, where a mask joined as data is the
+    /// console's number. None where an operand is a lane mask.
+    fn mask_op_on_numbers(&mut self, v: Value, depth: u32) -> Option<V> {
+        if let Some(&Val::I32(x)) = self.vals.get(&v) {
+            // (A join read so is lowered as the number its paths bring.)
+            if self.phi_at.contains_key(&v) {
+                self.read_phis.insert(v);
+            }
+            return Some(x);
+        }
+        if self.mask_data != MaskData::Console || depth > 16 {
+            return None;
+        }
+        if self.params.contains_key(&v) {
+            return match self.get(v) {
+                Ok(Val::I32(x)) => Some(x),
+                _ => None,
+            };
+        }
+        let x = self.x;
+        let inst: &Inst = x
+            .p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.writes.iter().any(|w| w.1 == v && matches!(w.0, Reg::S(_))))?;
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let op = inst.name().strip_prefix("s_")?.strip_suffix("_b32")?;
+        if !matches!(op, "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not" | "mov") {
+            return None;
+        }
+        let mut xs = Vec::with_capacity(2);
+        for o in src {
+            let n = match *o {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    let r = inst.read(Reg::S(code))?;
+                    self.mask_op_on_numbers(r, depth + 1)?
+                }
+                Operand::Scalar { .. } => self.s.m.i32(0),
+                Operand::Literal(k) => self.s.m.i32(k),
+                Operand::Const(k) => self.s.m.i32(crate::resource::inline(k)?),
+                _ => return None,
+            };
+            xs.push(n);
+        }
+        let c = self.cur;
+        let ones = self.s.m.i32(u32::MAX);
+        let not = |l: &mut Self, a: V| l.s.m.bin(c, Bin::Xor, a, ones);
+        let r = match (op, &xs[..]) {
+            ("mov", &[a]) => a,
+            ("not", &[a]) => not(self, a),
+            ("and", &[a, b]) => self.s.m.bin(c, Bin::And, a, b),
+            ("or", &[a, b]) => self.s.m.bin(c, Bin::Or, a, b),
+            ("xor", &[a, b]) => self.s.m.bin(c, Bin::Xor, a, b),
+            ("andn2", &[a, b]) => {
+                let nb = not(self, b);
+                self.s.m.bin(c, Bin::And, a, nb)
+            }
+            ("orn2", &[a, b]) => {
+                let nb = not(self, b);
+                self.s.m.bin(c, Bin::Or, a, nb)
+            }
+            ("nand", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::And, a, b);
+                not(self, t)
+            }
+            ("nor", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::Or, a, b);
+                not(self, t)
+            }
+            ("xnor", &[a, b]) => {
+                let t = self.s.m.bin(c, Bin::Xor, a, b);
+                not(self, t)
+            }
+            _ => return None,
+        };
+        Some(r)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        // A mask operation on numbers (`sop`): its number is known.
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
@@ -3494,6 +3636,16 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            // Bits taken out of a register that joins a lane mask and data,
+            // lowered as the number it is (the ray tracer's SGPRs, reused
+            // between saved masks and constant-buffer fields): on numbers
+            // the mask operations give the console's number.
+            if !high
+                && MASK_OPS_ON_NUMBERS.get()
+                && let Some(x) = self.mask_op_on_numbers(lo, 0)
+            {
+                return Ok(x);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -6444,6 +6596,28 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // The same, of a view picked from a table or the heap at an
+            // index the program computes (the ray tracer's structure, by
+            // an index from a constant buffer): the address from the
+            // host's table by view heap slot.
+            if count <= 4
+                && let Some((lo, hi)) = self.heap_view_address(site)?
+            {
+                for k in 0..count {
+                    let reg = Reg::S(code + k as u8);
+                    match k {
+                        0 => self.write(inst, reg, lo, None),
+                        1 => self.write(inst, reg, hi, None),
+                        _ => {
+                            if let Some(v) = inst.write(reg) {
+                                self.vals.insert(v, Val::Missing(OTHER));
+                                self.stale.insert(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             if std::env::var_os("VICTORY_DESC_WHY").is_some() {
                 eprintln!(
                     "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
@@ -7167,43 +7341,8 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A handle for the descriptor `src` read at `site`; a view read from a
-    /// table is noted with the used resource it falls in, so that what the
-    /// shader writes through it is known by entry ([`Shader::op`]).
+    /// A handle for the descriptor `src` read at `site`.
     fn handle(
-        &mut self,
-        site: Site,
-        src: &Source,
-        sampler: bool,
-        props: (u32, u32),
-    ) -> Result<V, Why> {
-        let h = self.handle_made(site, src, sampler, props)?;
-        if !sampler && !matches!(src, Source::Built { .. } | Source::Constant(_)) {
-            let entry = self.table_entry_of(src);
-            let noted = self.s.table_handles.entry(h).or_insert(entry);
-            if *noted != entry {
-                // One handle, two entries: neither can be told apart.
-                *noted = None;
-            }
-        }
-        Ok(h)
-    }
-
-    /// The one table entry (`(user_data, table_offset_dwords)` of its used
-    /// resource) descriptor `src` is read from, or `None` if it may be any
-    /// of several or none is known.
-    fn table_entry_of(&self, src: &Source) -> Option<(u8, u32)> {
-        let one = |s: &Source| {
-            self.used_kind(s)
-                .filter(|u| u.root == RootType::Table)
-                .map(|u| (u.user_data, u.table_offset_dwords))
-        };
-        let all: Vec<Option<(u8, u32)>> = src.leaves().into_iter().map(one).collect();
-        let first = *all.first()?;
-        all.iter().all(|e| *e == first).then_some(first).flatten()
-    }
-
-    fn handle_made(
         &mut self,
         site: Site,
         src: &Source,
@@ -11111,7 +11250,10 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 81) {
                 return Err("a cube sample with texel coordinates or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // A level query takes no array slice (the code may pass anything
+            // there, e.g. an unwritten register; DXIL wants it undefined).
+            let read = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(read) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }

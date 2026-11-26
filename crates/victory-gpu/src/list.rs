@@ -203,6 +203,13 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Releases this list's dynamic descriptor slots once its GPU submission
+    /// has completed, without waiting for the full `bury_lag` allocator delay
+    /// (from cool_fox).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
@@ -233,28 +240,6 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
-
-/// The most host lists kept idle while the PC is short of RAM
-/// (`crate::host::ram_short`, after fxceless #1240: 16).
-#[cfg(windows)]
-pub(crate) const IDLE_WHEN_SHORT: usize = 16;
-
-/// Lets idle host lists past [`IDLE_WHEN_SHORT`] go (the PC is short of
-/// RAM); how many went.
-#[cfg(windows)]
-pub(crate) fn trim_idle() -> u64 {
-    let gone = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() <= IDLE_WHEN_SHORT {
-            return 0;
-        }
-        let gone = idle.0.split_off(IDLE_WHEN_SHORT);
-        idle.1 -= gone.iter().map(|Idle(_, bytes)| *bytes).sum::<u64>();
-        gone
-    };
-    // (Their allocators go back without the lock.)
-    gone.len() as u64
-}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -295,9 +280,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        // Short of RAM (`VICTORY_RAM_TRIM_MB`): few kept.
-        let most = if crate::host::ram_short() { IDLE_WHEN_SHORT } else { IDLE_MOST.0 };
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -305,7 +288,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -829,7 +812,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.barriers(host) };
         }
     }
     0
@@ -842,8 +825,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
     }
 }
 
@@ -873,7 +857,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
         return;
     }
     if list.place_copy(to as usize, from as usize, len) {
-        with_state(this, |list, state| state.copied(list));
+        with_state(this, |_, state| state.copied());
     } else {
         list.defer_copy(to, from, len);
     }
@@ -903,16 +887,7 @@ extern "system" fn copy_buffer_region(
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
-fn unlike(dst: This, src: This, mapped: bool) -> bool {
-    // Copies that cannot map to retained levels cannot use a smaller host
-    // texture (fxceless #610).
-    if !mapped && (crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
-        });
-        return true;
-    }
+fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -938,8 +913,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            let levelwise = crate::resource::dropped(dst) != crate::resource::dropped(src);
-            if unlike(dst, src, true) {
+            if unlike(dst, src) {
                 return;
             }
             // Two title textures over the same memory have one host
@@ -981,12 +955,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            if levelwise {
-                copy_levels(list, dst, to, src, from);
-            } else {
-                // SAFETY: an open list and live textures.
-                unsafe { list.list.CopyResource(to, from) };
-            }
+            // SAFETY: an open list and live textures.
+            unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -996,44 +966,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
-}
-
-/// A whole-texture copy between host copies that leave out different
-/// numbers of levels (`crate::resource::drop_levels`): each title level both
-/// host copies have, at its own index in each. A title level has the same
-/// size in every host copy that has it.
-#[cfg(windows)]
-fn copy_levels(
-    list: &crate::host::HostList,
-    dst: This,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    src: This,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        ID3D12Resource,
-    };
-    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the location never releases.
-        pResource: unsafe { std::mem::transmute_copy(texture) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
-    };
-    let to_base = crate::resource::copy_base(dst, to);
-    let from_base = crate::resource::copy_base(src, from);
-    let count = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
-    for index in 0..count {
-        let (Some(d), Some(s)) = (
-            crate::resource::host_subresource_from(dst, index, to_base),
-            crate::resource::host_subresource_from(src, index, from_base),
-        ) else {
-            continue;
-        };
-        // SAFETY: an open list and live textures; both subresources exist
-        // and have the title level's size.
-        unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
-    }
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1109,20 +1041,8 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource, true) {
+        if unlike(dst.resource, src.resource) {
             return;
-        }
-        let remap = crate::resource::dropped(dst.resource) > 0 || crate::resource::dropped(src.resource) > 0;
-        let mut to_location = dst;
-        if remap && dst.kind != FOOTPRINT {
-            let Some(index) = crate::resource::host_subresource_from(
-                dst.resource,
-                dst.footprint.offset as u32,
-                crate::resource::copy_base(dst.resource, to),
-            ) else {
-                return;
-            };
-            to_location.footprint.offset = u64::from(index);
         }
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
@@ -1163,16 +1083,6 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if remap {
-                let Some(index) = crate::resource::host_subresource_from(
-                    src.resource,
-                    src.footprint.offset as u32,
-                    crate::resource::copy_base(src.resource, texture),
-                ) else {
-                    return;
-                };
-                from.footprint.offset = u64::from(index);
-            }
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1180,7 +1090,7 @@ extern "system" fn copy_texture_region(
             same = texture.as_raw() == to.as_raw()
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
-                && from.footprint.offset as u32 == to_location.footprint.offset as u32;
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1237,6 +1147,7 @@ extern "system" fn copy_texture_region(
             return;
         }
         ensure_state(list, dst.resource, COPY_DEST);
+        let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
@@ -1311,7 +1222,6 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    let index = crate::resource::readback_subresource(src.resource, src.footprint.offset as u32)?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1323,7 +1233,6 @@ fn read_back(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
-    from.footprint.offset = u64::from(index);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
@@ -1383,7 +1292,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src, false) {
+        if unlike(dst, src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -1540,7 +1449,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
-            with_state(this, |list, state| state.copied(list));
+            with_state(this, |_, state| state.copied());
             return;
         }
         list.defer(move || {
@@ -1676,7 +1585,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            unsafe { list.list.barriers(&[barrier]) };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2249,7 +2158,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

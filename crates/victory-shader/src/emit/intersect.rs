@@ -52,13 +52,6 @@ enum NodeAt {
 }
 
 /// The ray operands, as floats.
-struct Ray {
-    extent: V,
-    origin: [V; 3],
-    direction: [V; 3],
-    inverse: [V; 3],
-}
-
 /// `VICTORY_BVH_MISS=1` (off by default): the node test misses every node.
 /// While the structure builder is off the structures are never built, and a
 /// walk of what lies in their memory is not the console's. Part of the shader
@@ -66,6 +59,13 @@ struct Ray {
 pub(crate) fn bvh_miss() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
+struct Ray {
+    extent: V,
+    origin: [V; 3],
+    direction: [V; 3],
+    inverse: [V; 3],
 }
 
 impl<'a> Lower<'a> {
@@ -200,9 +200,6 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        // `VICTORY_BVH_MISS=1` (trustno1 24a479d3): every node is missed
-        // without being read, a box returns no child and a triangle the
-        // triangle miss, so a walk ends at its first node.
         let boxes = if bvh_miss() {
             [self.s.m.i32(bvh::NONE); 4]
         } else {

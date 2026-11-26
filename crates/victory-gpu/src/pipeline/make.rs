@@ -43,23 +43,16 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
-    /// Why this pipeline is left out on purpose ([`left_out`]).
+    /// Why this pipeline is left out on purpose (`VICTORY_RT_SKIP_*`).
     left_out: Option<&'static str>,
 }
 
-/// Whether a compute shader's container names `name`.
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-/// (cool_fox 8cc31ab3, opt-in here) With the structure builder off the
-/// title's ray-tracing structures are never built, so its ray work walks
-/// stale memory on the card for nothing. `VICTORY_RT_SKIP_RESOLVE=1` leaves
-/// out the `CS_RaytracingResolve` pipelines (about a thousand) and
-/// `VICTORY_RT_SKIP_ACTIVATE=1` the `CS_ScreenProbes_ActivateRays` ones:
-/// their dispatches are dropped. Never with `VICTORY_BVH_BUILDER=1`.
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP: OnceLock<(bool, bool)> = OnceLock::new();
     let (resolve, activate) = *SKIP.get_or_init(|| {
@@ -118,9 +111,6 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            if made.is_none() {
-                FAILED.fetch_add(1, Ordering::Relaxed);
-            }
             made
         });
         let (lock, done) = &DONE;
@@ -195,14 +185,6 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
-}
-
-/// Pipelines that could not be made (a shader that does not translate, or
-/// the driver's refusal), since the start.
-static FAILED: AtomicU64 = AtomicU64::new(0);
-
-pub(super) fn failed() -> u64 {
-    FAILED.load(Ordering::Relaxed)
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);

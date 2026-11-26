@@ -391,7 +391,7 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
-    /// A frame is shown: the texture and the state its lists leave it in.
+    /// A frame is shown: one texture or composed Series S planes.
     Present(Present, super::Shown),
 }
 
@@ -572,8 +572,6 @@ impl Work for Job {
             Job::Present(present, shown) => {
                 match present {
                     Present::Copy(Some((texture, state))) => {
-                        // (Where its lists were not translated when the title
-                        // presented: the state they left it in.)
                         let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
                         super::show(&texture.texture, state, shown);
                     }
@@ -820,7 +818,7 @@ pub(super) enum Present {
     Planes(Vec<crate::host::PresentPlane>, bool),
 }
 
-/// A present ordered after preceding work on queue `this`.
+/// A present on queue `this`.
 pub(super) fn present(this: This, present: Present, shown: super::Shown) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
