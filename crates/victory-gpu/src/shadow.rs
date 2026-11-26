@@ -545,6 +545,19 @@ fn windows_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
 }
 
+/// How full the card may be (percent of its budget) for a window to go to
+/// it (`VICTORY_CARD_WINDOWS_PERCENT`, 80): on an 8 GB card the title's own
+/// textures and targets keep it above 80 %, and no window ever moved.
+fn window_card_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(10, 98))
+    })
+}
+
 /// [`window_card_for`] in the card's own memory.
 fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
@@ -556,7 +569,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_percent()
     {
         return None;
     }
