@@ -970,6 +970,17 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // The precompiled `.spv` index (görev 1): how many files it
+            // holds and how many misses its negative cache remembered.
+            let (files, keys, negative) = crate::spirv_index::counts();
+            if files > 0 {
+                tracing::info!(
+                    files,
+                    keys,
+                    negative,
+                    "precompiled .spv index (negative cache misses remembered)"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

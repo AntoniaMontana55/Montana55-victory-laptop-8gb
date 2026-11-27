@@ -75,6 +75,9 @@
 /prompt.txt.txt
 /shader.PNG
 
+# Live subtitle translations made while playing (game text; kept local)
+/tr_subtitles_cache.json
+
 # Editor / OS noise
 .vs/
 .idea/

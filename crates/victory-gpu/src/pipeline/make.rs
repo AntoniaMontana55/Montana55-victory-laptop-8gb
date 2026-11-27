@@ -82,6 +82,33 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         skip
     });
     left_out_for_flags(shaders, resolve, activate, extra, cutscene_fast)
+        .or_else(|| shadow_light(shaders))
+}
+
+/// `VICTORY_SHADOW_LIGHT=1`: drops the far/secondary shadow cascades and the
+/// distant cascades' tile-masking compute while keeping the near cascade
+/// (characters, vehicles, weapons) fully lit and crisp — the far ones cover
+/// far geometry the reduced render scale makes hard to notice anyway.
+/// A separate switch from [`left_out`]'s cutscene flags so it can be tried
+/// alone; off by default to keep shadow fidelity identical to the default
+/// profile.
+fn shadow_light(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SHADOW_LIGHT").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    // Only the far cascade variants: the near cascade's names
+    // (`CS_Shadow_Near`, `ShadowCascade0`) are deliberately not matched, so
+    // characters, vehicles and weapons keep crisp contact shadows.
+    if named(shaders, b"CS_Shadow_Far")
+        || named(shaders, b"ShadowCascade3")
+        || named(shaders, b"ShadowCascade4")
+        || named(shaders, b"CS_Shadow_Distant")
+        || named(shaders, b"ShadowFar")
+    {
+        return Some("far shadow cascade skipped (VICTORY_SHADOW_LIGHT=1)");
+    }
+    None
 }
 
 fn left_out_for_flags(

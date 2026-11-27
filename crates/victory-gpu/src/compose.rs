@@ -5,6 +5,8 @@
 //! From the codec-d/cool_fox fork (641835a4, 581b0cb9). Only with
 //! `VICTORY_PLANES=1` ([`on`]); else the first plane is shown alone, as before.
 
+use std::fmt::Write as _;
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -34,6 +36,60 @@ float4 ps(V v) : SV_Target {
 }
 "#;
 
+/// Whether the scene plane is sharpened as it is composited
+/// (`VICTORY_SHARPENING`, 0.0 to 1.0; off without it). The scene alone is
+/// sharpened — the interface plane (HUD, subtitles) and our Turkish
+/// subtitle box are drawn after, at the output's own 1920x1080, so they
+/// keep full sharpness. A cheap 4-neighbour unsharp mask; the strength is
+/// how much of the high-pass the taps add back.
+pub(crate) fn sharpening() -> Option<f32> {
+    static AMOUNT: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *AMOUNT.get_or_init(|| {
+        let Some(spec) = std::env::var_os("VICTORY_SHARPENING").map(|v| v.to_string_lossy().into_owned()) else {
+            return None;
+        };
+        let amount = spec.trim().parse::<f32>().ok().filter(|s| (0.0..=1.0).contains(s));
+        if amount.is_none() {
+            eprintln!("VIctory: VICTORY_SHARPENING={spec}: expected 0.0 to 1.0 (0.3 is a good default)");
+        }
+        amount
+    })
+}
+
+/// The HLSL for the sharpening pass over the scene plane, `STRONG` the
+/// strength multiplied by 8 (a fixed cost in the shader).
+const SHARPEN_SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+Texture2D<float4> scene : register(t0);
+Texture2D<float4> over : register(t1);
+SamplerState smooth_ : register(s0);
+struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+[RootSignature(RS)]
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.uv = float2((id << 1) & 2, id & 2);
+    v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return v;
+}
+// A 4-neighbour unsharp mask: the centre minus the average of its four
+// neighbours is the high-pass; `STRONG`/8 of it is added back to the centre.
+// The interface plane is sampled once and passed through untouched: only the
+// 3D scene gets sharpened, the HUD and subtitles keep their exact pixels.
+[RootSignature(RS)]
+float4 ps(V v) : SV_Target {
+    float2 px = sharpenTexel;
+    float4 c = scene.SampleLevel(smooth_, v.uv, 0);
+    float4 n = scene.SampleLevel(smooth_, v.uv + float2(0, -px.y), 0);
+    float4 s = scene.SampleLevel(smooth_, v.uv + float2(0,  px.y), 0);
+    float4 e = scene.SampleLevel(smooth_, v.uv + float2( px.x, 0), 0);
+    float4 w = scene.SampleLevel(smooth_, v.uv + float2(-px.x, 0), 0);
+    float4 hi = c - 0.25 * (n + s + e + w);
+    float4 sharp = c + (STRONG / 8.0) * hi;
+    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    return float4(saturate(o.rgb + sharp.rgb * (1 - saturate(o.a))), 1);
+}
+"#;
+
 /// Whether a second presented plane is composed over the first
 /// (`VICTORY_PLANES`; on by default, `0` turns it off). It acts only when
 /// the title presents a second plane (the Series S profile does; Series X
@@ -48,6 +104,9 @@ pub(crate) struct Composer {
     pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
     step: u32,
+    /// The scene size the PSO was sharpened for, when sharpening is on (to
+    /// notice a size change and make the PSO again).
+    scene: (u32, u32),
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Composer {}
@@ -55,13 +114,40 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
+    compile_src(SOURCE, entry, target)
+}
+
+/// [`compile`] for a source that needs the sharpening symbols defined: the
+/// strength (×8, so the shader divides once) and the scene texture's texel
+/// size, sampled as constants at compile time — both known when the
+/// composer is made.
+fn compile_sharpened(
+    strength: f32,
+    texel: (f32, f32),
+    entry: PCSTR,
+    target: PCSTR,
+) -> windows::core::Result<ID3DBlob> {
+    // The template names its symbols; the defines go before everything.
+    let mut source = String::with_capacity(SHARPEN_SOURCE.len() + 96);
+    let _ = write!(
+        source,
+        "#define STRONG {:.6}\n#define sharpenTexel float2({:.9},{:.9})\n",
+        strength * 8.0,
+        texel.0,
+        texel.1
+    );
+    source.push_str(SHARPEN_SOURCE);
+    compile_src(&source, entry, target)
+}
+
+fn compile_src(source_text: &str, entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source_text.as_ptr().cast(),
+            source_text.len(),
             s!("compose"),
             None,
             None,
@@ -77,11 +163,30 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 }
 
 impl Composer {
-    pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
-        let (vs, ps) = (
-            compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
-        );
+    /// `scene`: the size of the scene plane the title presents, for the
+    /// sharpening taps' texel size (the interface plane and the output take
+    /// whatever size they have; the shader samples the scene at its own).
+    pub(crate) fn new(
+        host: &Host,
+        format: DXGI_FORMAT,
+        scene: (u32, u32),
+    ) -> windows::core::Result<Self> {
+        let (vs, ps) = match sharpening() {
+            Some(strength) => {
+                let texel = (
+                    1.0 / scene.0.max(1) as f32,
+                    1.0 / scene.1.max(1) as f32,
+                );
+                (
+                    compile_sharpened(strength, texel, s!("vs"), s!("vs_5_1"))?,
+                    compile_sharpened(strength, texel, s!("ps"), s!("ps_5_1"))?,
+                )
+            }
+            None => (
+                compile(s!("vs"), s!("vs_5_1"))?,
+                compile(s!("ps"), s!("ps_5_1"))?,
+            ),
+        };
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
             let bytes = |b: &ID3DBlob| {
@@ -121,8 +226,15 @@ impl Composer {
                 views: Vec::new(),
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                scene,
             })
         }
+    }
+
+    /// Whether the PSO must be made again: the scene was sharpened for
+    /// another size (its texel size is baked into the shader).
+    pub(crate) fn needs_remake(&self, scene: (u32, u32)) -> bool {
+        sharpening().is_some() && self.scene != scene
     }
 
     /// Each presenter command-list slot owns its own pair of SRVs. The swap
@@ -233,7 +345,7 @@ mod tests {
             return;
         };
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        let mut compositor = Composer::new(host, format).unwrap();
+        let mut compositor = Composer::new(host, format, (64, 1)).unwrap();
         let list = host.new_list().unwrap();
         let texture = |width: u64| -> ID3D12Resource {
             let mut resource = None;

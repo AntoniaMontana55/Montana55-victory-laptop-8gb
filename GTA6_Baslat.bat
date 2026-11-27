@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title clawz - GTA VI (RX 7600 8GB | 1080p Hikaye + Canli TR Altyazi)
+title clawz - GTA VI (RX 7600 8GB - 1080p Hikaye + Canli TR Altyazi)
 set "REPO=%~dp0"
 set "PS1=%REPO%scripts\play_rx7600_8gb.ps1"
 set "EXE=%REPO%target\release\victory.exe"

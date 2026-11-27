@@ -261,6 +261,9 @@ pub fn fingerprint() -> String {
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
+    // The precompiled `.spv` set (görev 1): scanned once here, into memory;
+    // lookups after this never touch the disk. Its own folder, not `dir`.
+    crate::spirv_index::init();
 }
 
 /// Makes the host pipelines of those of `which` (numbers in the file) and

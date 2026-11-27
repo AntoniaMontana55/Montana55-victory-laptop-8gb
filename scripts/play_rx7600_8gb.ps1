@@ -46,9 +46,9 @@ if ($Profile -eq '1') {
     $texBudgetMb     = 'dynamic'
     $texMax          = '0'
 } elseif ($Profile -eq '3') {
-    $profileName     = '3 - 1080p HIKAYE MAKS FPS (1920x1080 x0.58 | RELAY=2 | BATCH=2 | Dinamik TX)'
+    $profileName     = '3 - 1080p HIKAYE MAKS FPS (1920x1080 x0.60 | SHARPEN | RELAY=2 | Dinamik TX)'
     $outputMode      = '1920x1080'
-    $renderScale     = '0.58'
+    $renderScale     = '0.60'
     $texBudgetMb     = 'dynamic'
     $texMax          = '0'
 } else {
@@ -65,6 +65,9 @@ $texNoWait       = '0'
 $texCatchup      = '1'
 $texStageMs      = '200'
 $pipelineWaitMs  = '1500'
+# 0.60 gibi 2/3'un altindaki olceklerde title'in kendi kelepcesi
+# (vmaxss, +0x28f1e87) olcegi 2/3'a geri kaldirir; 0 onu kaldirir.
+$scaleClamp      = if ([double]$renderScale -lt 0.6667) { '0' } else { '1' }
 
 # === %100 SAF STANDART DXIL SHADER (25.694 ONBELLEKLE %100 UYUMLU) ===
 # PORT_CBV=0, PORT_DESCRIPTORS=0, PORT_CONSTANTS=0, BVH_MISS=0, FALLBACK_SHADER=0
@@ -95,6 +98,10 @@ $env:VICTORY_BAKE_TEXTURES_MS         = '2000'
 # === ZAMANLAMA, 1920x1080 CIKIS & CANLI SANSURSUZ TURKCE ALTYAZI ===
 # 0.6667 = Series S dogal 2/3 orani (1280x720 ic RT -> 1920x1080 cikis, en dusuk RT VRAM + sifir jitter)
 # VICTORY_SUBS=1 -> alt ortada yuvarlatilmis siyah kutu, ortalanmis beyaz yazi, F8 ac/kapa, tr_subtitles_cache.json
+# VICTORY_SHARPENING=0.35 -> 3B sahne compose aninda hafif unsharp mask ile keskinlesir;
+# UI/altyazi/hud 1920x1080 kendi piksellerinde kalir (compose shader'i yalniz sahne dokusunu ornekler).
+# VICTORY_SPIRV_DIR -> 26.503 hazir .spv (xbox_to_vulkan) tek seferlik bellek indeksi; VICTORY_SPIRV_DIR=0 kapatir.
+# VICTORY_SHADOW_LIGHT=1 -> uzak golge kademeleri (cascade 3/4) atlanir; karakter/tesisat/silah netligi korunur.
 $env:VICTORY_NO_WATCHDOG              = '1'
 $env:VICTORY_PLANES                   = '1'
 $env:VICTORY_SHOW_AFTER               = '1'
@@ -103,6 +110,10 @@ $env:VICTORY_OUTPUT                   = $outputMode
 $env:VICTORY_DISPLAY_MODE             = $outputMode
 $env:VICTORY_UPSCALER                 = '6'
 $env:VICTORY_RENDER_SCALE             = $renderScale
+$env:VICTORY_RENDER_SCALE_CLAMP        = $scaleClamp
+$env:VICTORY_SHARPENING               = '0.35'
+$env:VICTORY_SPIRV_DIR                = 'C:\Users\clawz\Desktop\xbox_to_vulkan\output_spirv'
+$env:VICTORY_SHADOW_LIGHT             = '1'
 $env:VICTORY_SUBS                     = '1'
 $env:VICTORY_SUBS_INTERVAL_MS         = '200'
 

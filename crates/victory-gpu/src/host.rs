@@ -10032,7 +10032,7 @@ impl Host {
         let state_u32 = state;
         let p = presenter.as_mut()?;
         if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
+            match crate::compose::Composer::new(self, format, (desc.Width as u32, desc.Height)) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
@@ -10077,8 +10077,19 @@ impl Host {
                 }
             }
         }
+        if planes.is_some()
+            && let Some(c) = p.composer.as_ref()
+            && c.needs_remake((desc.Width as u32, desc.Height))
+        {
+            // The scene's size changed: the sharpening taps' texel size is
+            // baked into the PSO's shader. Make the composer again.
+            match crate::compose::Composer::new(self, p.format, (desc.Width as u32, desc.Height)) {
+                Ok(c) => p.composer = Some(c),
+                Err(e) => tracing::warn!(error = %e, "sharpening composer not remade; keeping the old one"),
+            }
+        }
         if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
+            match crate::compose::Composer::new(self, format, (desc.Width as u32, desc.Height)) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");

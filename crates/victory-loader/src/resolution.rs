@@ -62,9 +62,10 @@ pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
 
 /// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
 /// height): the title's own upscaler's scale (Series X; 2/3 without it).
-/// Tested at 1.0 (run res-4); below 2/3 the title's largest render size
-/// (+0x94, max(2/3, scale)) stays at 2/3. `None` if unset or out of range
-/// (said why).
+/// Tested at 1.0 (run res-4); below 2/3 the title's clamp (+0x28f1e87,
+/// `vmaxss` with the 2/3 at [`OWN_SCALE`]) floors the scale back to 2/3 —
+/// `VICTORY_RENDER_SCALE_CLAMP=0` takes the floor out, so 0.50–0.60 means
+/// what it says. `None` if unset or out of range (said why).
 pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
     let scale = parse_render_scale(&spec);
@@ -158,6 +159,27 @@ pub const OWN_SCALE: Site = Site {
     what: "the title's own upscaler's render scale",
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
+
+/// The clamp right after it, +0x28f1e87: `vmaxss xmm0, xmm0, [rsi+90h]`
+/// (so the scale in force is never below the 2/3 written at
+/// [`OWN_SCALE`]) then `vmovss [rsi+94h], xmm0`. With the clamp in place a
+/// render scale below 2/3 (`VICTORY_RENDER_SCALE=0.60`) still renders at
+/// 2/3; `VICTORY_RENDER_SCALE_CLAMP=0` replaces the `vmaxss` with the same
+/// `vmovss` (one opcode byte, the same length), passing the scale through:
+/// 0.50–0.60 renders at what was asked.
+pub const SCALE_CLAMP: Site = Site {
+    at: 0x28f1e87,
+    what: "the render scale's 2/3 floor (vmaxss)",
+    bytes: &[0xc5, 0xfa, 0x5f, 0x86, 0x90, 0x00, 0x00, 0x00],
+};
+
+/// What goes at [`SCALE_CLAMP`]: `vmovss xmm0, [rsi+90h]` (the scale as it
+/// is, no maximum taken).
+pub fn scale_clamp_off() -> Vec<u8> {
+    let mut c = SCALE_CLAMP.bytes.to_vec();
+    c[2] = 0x10; // vmaxss -> vmovss
+    c
+}
 
 /// FidelityFX's render size method, +0x28ef680, and its padding: the scale
 /// is 1.0 (+0x5fc6ed8) or, on Series S, 2/3 (+0x615d95c), loaded at +0x28
@@ -322,6 +344,15 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     }
     if let Some(s) = asked_render_scale() {
         asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        // Below 2/3 the title's own clamp (+0x28f1e87) floors the scale back
+        // to 2/3: take the clamp out so 0.50–0.60 means what it says
+        // (`VICTORY_RENDER_SCALE_CLAMP=0`).
+        if s < 2.0 / 3.0
+            && std::env::var_os("VICTORY_RENDER_SCALE_CLAMP")
+                .is_none_or(|v| v == "0")
+        {
+            asked.push((&SCALE_CLAMP, scale_clamp_off(), "floor off".into()));
+        }
     }
     if let Some(s) = asked_ffx_scale() {
         asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
@@ -420,6 +451,12 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+        // Taking the 2/3 floor out: one opcode byte, the same length.
+        let floorless = scale_clamp_off();
+        assert_eq!(floorless.len(), SCALE_CLAMP.bytes.len());
+        assert_eq!(&floorless[..2], &[0xc5, 0xfa], "vmovss xmm0's prefixes");
+        assert_eq!(floorless[2], 0x10, "vmovss (a load), not vmaxss");
+        assert_eq!(&floorless[3..], &SCALE_CLAMP.bytes[3..], "the address [rsi+90h] keeps");
     }
 
     #[cfg(windows)]
