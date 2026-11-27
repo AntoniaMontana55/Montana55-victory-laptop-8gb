@@ -33,15 +33,31 @@ Start-Sleep -Milliseconds 300
 # Eski VICTORY_* degiskenlerini temizle
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
-# Sabit Profil (Menu yok, tek tik): Varsayilan 2 = Net + Saf Shader, 1 = Hafif (Maks FPS)
+# Sabit Profil (Menu yok, tek tik):
+# Varsayilan 2 = TAM MODEL + SIFIR COKME (Senkron yukleme, sifir atlanan model/doku)
+# Profil 1     = HIZLI (RELAY=2, daha yuksek FPS, 1280x720 x0.50)
 if ($Profile -eq '1') {
-    $profileName = '1 - HAFIF (Maks FPS | 1280x720 x0.50 | %100 Saf Shader)'
-    $renderScale = '0.5'
-    $texBudgetMb = '1280'
+    $profileName     = '1 - HIZLI (RELAY=2 | 1280x720 x0.50 | %100 Saf Shader)'
+    $renderScale     = '0.5'
+    $texBudgetMb     = '1792'
+    $relayMode       = '2'
+    $lateWait        = '3'
+    $asyncSubmit     = '1'
+    $texNoWait       = '0'
+    $texCatchup      = '1'
+    $texStageMs      = '400'
+    $pipelineWaitMs  = '1000'
 } else {
-    $profileName = '2 - SABIT TEMIZ (1920x1080 x0.6667 | %100 Saf Shader + Tam Model)'
-    $renderScale = '0.6667'
-    $texBudgetMb = '1536'
+    $profileName     = '2 - TAM MODEL + SIFIR COKME (Senkron | 1080p x0.6667 | %100 Saf Shader)'
+    $renderScale     = '0.6667'
+    $texBudgetMb     = '2560'
+    $relayMode       = '0'
+    $lateWait        = '0'
+    $asyncSubmit     = '0'
+    $texNoWait       = '0'
+    $texCatchup      = '1'
+    $texStageMs      = '500'
+    $pipelineWaitMs  = '2000'
 }
 
 # === %100 SAF STANDART DXIL SHADER (HICBIR SHADER BOZULMAZ, 25.694 ONBELLEKLE %100 UYUMLU) ===
@@ -75,16 +91,20 @@ $env:VICTORY_UPSCALER                 = '6'
 $env:VICTORY_RENDER_SCALE             = $renderScale
 
 # === HIZ, TAM MODEL & DIRECTSTORAGE STREAMING (RX 7600 8 GB + 16 GB RAM) ===
-$env:VICTORY_RELAY                    = '2'
+# Profil 2 (varsayilan): RELAY=0 + LATE_WAIT=0 + ASYNC_SUBMIT=0 + INDIRECT_BATCH=1
+# -> Her kare GPU->CPU copy-back tamamlanarak cizilir (eksik bina/duvar/karakter yok,
+#    WDDM Shared GPU bellegi ~2 GB daha hafif, PRELUDE_RING ile 0x8007000E sifir!).
+$env:VICTORY_RELAY                    = $relayMode
+$env:VICTORY_LATE_WAIT                = $lateWait
 $env:VICTORY_RELAY_COPY               = '1'
 $env:VICTORY_CLAMP_WAITS              = 'ON'
 $env:VICTORY_THIN                     = '0'
 $env:VICTORY_UPLOAD_AHEAD             = '0'
-$env:VICTORY_ASYNC_SUBMIT             = '1'
+$env:VICTORY_ASYNC_SUBMIT             = $asyncSubmit
 $env:VICTORY_WIDE_BACK                = '1'
 $env:VICTORY_WIDE_REFRESH             = '1'
 $env:VICTORY_JOIN_COPIES              = '1'
-$env:VICTORY_INDIRECT_BATCH           = '2'
+$env:VICTORY_INDIRECT_BATCH           = '1'
 $env:VICTORY_INDIRECT_WINDOW          = '1'
 $env:VICTORY_CARD_REHASH_RUNS         = '1'
 $env:VICTORY_CARD_STEPS               = '2'
@@ -98,9 +118,9 @@ $env:VICTORY_VIEW_BYTES               = '1'
 $env:VICTORY_DYNAMIC_SLOTS            = '524288'
 
 # === 8 GB VRAM + 16 GB RAM BELLEK & MESH ONCELIGI ===
-# LEVELS_ON_DEMAND=0 + HELD_LEVELS=1 -> siyah karo yok, dinamik VRAM mip-drop (80%/88%) aktif!
-# BURY_LAG=64 -> AMD RDNA 3 sayfa hatasi (0x887A0001) sifir!
-# THIN=0 + WINDOW_BUDGET_MB=2048 -> 8 GB WDDM Shared GPU duvarina (0x8007000E) carpmaz!
+# LEVELS_ON_DEMAND=0 + HELD_LEVELS=1 + TEXTURE_NO_WAIT=0 + TEXTURE_CATCHUP=1
+# -> Siyah karo ve yarim yuklu model yok, 3x catchup + dinamik VRAM mip-drop aktif!
+# BURY_LAG=64 + PRELUDE_RING -> 0x887A0001 ve "no host list for a state prelude" sifir!
 $env:VICTORY_RESIDENCY                = '1'
 $env:VICTORY_RESIDENCY_LIMITED        = '1'
 $env:VICTORY_KEEP_FREED               = '1'
@@ -108,10 +128,11 @@ $env:VICTORY_BURY_LAG                 = '64'
 $env:VICTORY_SUBMIT_CHUNK             = '8'
 $env:VICTORY_LEVELS_ON_DEMAND         = '0'
 $env:VICTORY_HELD_LEVELS              = '1'
-$env:VICTORY_TEXTURE_NO_WAIT          = '1'
-$env:VICTORY_TEXTURE_CATCHUP          = '0'
+$env:VICTORY_TEXTURE_NO_WAIT          = $texNoWait
+$env:VICTORY_TEXTURE_CATCHUP          = $texCatchup
+$env:VICTORY_TEXTURE_STAGE_MS         = $texStageMs
 $env:VICTORY_TEXTURE_BUDGET_MB        = $texBudgetMb
-$env:VICTORY_TEXTURE_ROOM_PERCENT     = '85'
+$env:VICTORY_TEXTURE_ROOM_PERCENT     = '92'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1280'
 $env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
 $env:VICTORY_CARD_BUFFERS_MB          = '512'
@@ -124,23 +145,23 @@ $env:VICTORY_SEND_KEPT_MB             = '64'
 $env:VICTORY_DSTORAGE_STAGING_MB      = '128'
 $env:VICTORY_DSTORAGE_RETRIES         = '48'
 $env:VICTORY_DSTORAGE_PAGE_WAIT_MS    = '5000'
-$env:VICTORY_PIPELINE_WAIT_MS         = '500'
+$env:VICTORY_PIPELINE_WAIT_MS         = $pipelineWaitMs
 $env:VICTORY_SCREEN_WAIT_MS           = '10000'
 $env:VICTORY_MEMORY_MAP               = '0'
 $env:VICTORY_PIPELINE_BOOK            = '0'
 $env:VICTORY_D3D12_DRED               = 'light'
 $env:RUST_LOG                         = 'error'
 
-$Host.UI.RawUI.WindowTitle = "clawz - GTA VI (RX 7600 8GB | %100 Saf Shader + Tam Model)"
+$Host.UI.RawUI.WindowTitle = "clawz - GTA VI (RX 7600 8GB | Tam Model + Sifir Cokme)"
 Clear-Host
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "                           C L A W Z   G T A   V I                          " -ForegroundColor Cyan
-Write-Host "        RX 7600 8GB | %100 Saf DXIL Shader + Tam Model + Tek Tik            " -ForegroundColor Cyan
+Write-Host "         RX 7600 8GB | %100 Saf DXIL + Tam Model + PRELUDE_RING             " -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil    : $profileName" -ForegroundColor Green
 Write-Host "  Shader    : %100 Saf DXIL (PORT_CBV=0 | BVH_MISS=0 | RT_RESOLVE=ON | Mor Filtre)" -ForegroundColor Yellow
-Write-Host "  Modeller  : 16B/Exact Mirroring + DirectStorage 128MB/48-Retry + Mip-Drop" -ForegroundColor Cyan
-Write-Host "  Koruma    : THIN=0 + WINDOW_BUDGET=2048MB + BURY_LAG=64 + CLAMP_WAITS=ON" -ForegroundColor Cyan
+Write-Host "  Modeller  : Senkron Yukleme + CATCHUP=1 + NO_WAIT=0 + 2560MB + 128MB/48-Retry" -ForegroundColor Cyan
+Write-Host "  Koruma    : PRELUDE_RING (OOM sifir) + BURY_LAG=64 + CLAMP_WAITS=ON" -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
 
 $hogs = Get-Process Discord,Spotify,brave,chrome -ErrorAction SilentlyContinue | Group-Object Name | ForEach-Object {
