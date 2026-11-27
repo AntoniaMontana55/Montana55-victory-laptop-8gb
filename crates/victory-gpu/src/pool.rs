@@ -47,17 +47,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let tight_vram = memory.is_some_and(|[budget, ..]| budget > 0 && budget <= (9u64 << 30));
     let pressure = crate::residency::pressured();
     let keep = crate::host::keep_freed() && !pressure && !tight_vram;
-    let limit = spares(memory, keep);
+    let limit = if tight_vram || pressure { 1 } else { spares(memory, keep) };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if crate::residency::critical_commit() || pressure || tight_vram {
             0
-        } else if pressure || tight_vram {
-            1
         } else {
             limit
         };

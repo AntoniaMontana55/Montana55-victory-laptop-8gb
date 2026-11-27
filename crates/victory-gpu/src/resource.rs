@@ -1327,10 +1327,22 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
+    let tight_card = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[budget, ..]| budget > 0 && budget <= (9u64 << 30));
+    let max = set.unwrap_or_else(|| {
+        if tight_card {
+            match video_memory_percent() {
+                0..82 => 512,
+                _ => 256,
+            }
+        } else {
+            match video_memory_percent() {
+                0..92 => 1024,
+                92..97 => 512,
+                _ => 256,
+            }
+        }
     });
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
@@ -1865,11 +1877,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return true;
     }
     match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used — so 3D geometry buffers and targets always have priority.
-        Some([budget, used, ..]) => {
+        // Strict zero-spill budget controller: never allow Local VRAM to cross
+        // 90% of the OS budget (e.g. 5.94 GiB of 6.6 GiB) or keep growing while
+        // WDDM is already spilling >= 3.5 GiB into Shared System RAM.
+        Some([budget, used, _, shared]) => {
+            if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
+                return false;
+            }
+            if budget > 0
+                && budget <= (9u64 << 30)
+                && shared >= (3584u64 << 20)
+                && u128::from(used) * 100 >= u128::from(budget) * 82
+            {
+                return false;
+            }
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
         }
@@ -2224,7 +2245,21 @@ pub(crate) fn let_go_idle() {
         let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
         if filled > limit / 10 * 9 {
             let target = filled.saturating_sub(limit / 10 * 8);
-            idle_ms = idle_ms.min(2_000);
+            idle_ms = idle_ms.min(1_500);
+            most = if most == u64::MAX { target } else { most.max(target) };
+        }
+    }
+    // Zero-spill Shared RAM guard on 8 GB cards: when WDDM spills >= 2.5 GiB
+    // into Shared RAM or Local crosses 85% of budget, reclaim stale textures
+    // promptly so active characters/vehicles/buildings always have room.
+    if let Some([budget, used, _, shared]) = memory
+        && budget > 0
+        && budget <= (9u64 << 30)
+        && (shared >= (2560u64 << 20) || u128::from(used) * 100 >= u128::from(budget) * 85)
+    {
+        let target = used.saturating_sub(budget / 100 * 68);
+        if target > 0 {
+            idle_ms = idle_ms.min(1_500);
             most = if most == u64::MAX { target } else { most.max(target) };
         }
     }

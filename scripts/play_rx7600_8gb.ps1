@@ -34,31 +34,28 @@ Start-Sleep -Milliseconds 300
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
 # Sabit Profil (Menu yok, tek tik):
-# Varsayilan 2 = TAM MODEL + SIFIR COKME (Senkron yukleme, sifir atlanan model/doku)
-# Profil 1     = HIZLI (RELAY=2, daha yuksek FPS, 1280x720 x0.50)
+# Varsayilan 2 = RX 7600 8GB SIFIR TASMA + 30 FPS + TAM MODEL (720p RT tasarrufu, RELAY=2, TX<=1.5GB)
+# Profil 1     = 936p YUKSEK COZUNURLUK (1664x936 x0.6667 | daha yuksek netlik, ~350MB fazla RT)
 if ($Profile -eq '1') {
-    $profileName     = '1 - HIZLI (RELAY=2 | 1280x720 x0.50 | %100 Saf Shader)'
-    $renderScale     = '0.5'
-    $texBudgetMb     = '1792'
-    $relayMode       = '2'
-    $lateWait        = '3'
-    $asyncSubmit     = '1'
-    $texNoWait       = '0'
-    $texCatchup      = '1'
-    $texStageMs      = '400'
-    $pipelineWaitMs  = '1000'
-} else {
-    $profileName     = '2 - TAM MODEL + SIFIR COKME (Senkron | 1080p x0.6667 | %100 Saf Shader)'
+    $profileName     = '1 - 936p NET (1664x936 x0.6667 | RELAY=2 | %100 Saf Shader)'
+    $outputMode      = '1664x936'
     $renderScale     = '0.6667'
-    $texBudgetMb     = '2560'
-    $relayMode       = '0'
-    $lateWait        = '0'
-    $asyncSubmit     = '0'
-    $texNoWait       = '0'
-    $texCatchup      = '1'
-    $texStageMs      = '500'
-    $pipelineWaitMs  = '2000'
+    $texBudgetMb     = '1408'
+    $texMax          = '512'
+} else {
+    $profileName     = '2 - SIFIR TASMA + 30 FPS + TAM MODEL (1280x720 x0.6667 | RELAY=2 | TX 512px)'
+    $outputMode      = '1280x720'
+    $renderScale     = '0.6667'
+    $texBudgetMb     = '1536'
+    $texMax          = '512'
 }
+$relayMode       = '2'
+$lateWait        = '3'
+$asyncSubmit     = '1'
+$texNoWait       = '0'
+$texCatchup      = '1'
+$texStageMs      = '250'
+$pipelineWaitMs  = '1500'
 
 # === %100 SAF STANDART DXIL SHADER (HICBIR SHADER BOZULMAZ, 25.694 ONBELLEKLE %100 UYUMLU) ===
 # PORT_CBV=0, PORT_DESCRIPTORS=0, PORT_CONSTANTS=0, BVH_MISS=0, RT_SKIP_RESOLVE=0,
@@ -82,18 +79,18 @@ $env:VICTORY_AMBIENT_SHADE            = '0.55,0.5'
 $env:VICTORY_AMBIENT_AIR              = '1.0'
 $env:VICTORY_AMBIENT_SETTLE           = '150,2.5,1.0'
 
-# === ZAMANLAMA & CIKIS (Series S 1080p x0.6667 = 1280x720 tam hizali, sifir bozulma) ===
+# === ZAMANLAMA & CIKIS (720p RT = ~750 MB VRAM tasarrufu + 2x GPU hizi, sifir PSO hatasi) ===
 $env:VICTORY_NO_WATCHDOG              = '1'
 $env:VICTORY_PLANES                   = '1'
 $env:VICTORY_SHOW_AFTER               = '1'
 $env:VICTORY_FRAME_INTERVAL_MS        = '33.333'
+$env:VICTORY_OUTPUT                   = $outputMode
 $env:VICTORY_UPSCALER                 = '6'
 $env:VICTORY_RENDER_SCALE             = $renderScale
 
 # === HIZ, TAM MODEL & DIRECTSTORAGE STREAMING (RX 7600 8 GB + 16 GB RAM) ===
-# Profil 2 (varsayilan): RELAY=0 + LATE_WAIT=0 + ASYNC_SUBMIT=0 + INDIRECT_BATCH=1
-# -> Her kare GPU->CPU copy-back tamamlanarak cizilir (eksik bina/duvar/karakter yok,
-#    WDDM Shared GPU bellegi ~2 GB daha hafif, PRELUDE_RING ile 0x8007000E sifir!).
+# RELAY=2 + LATE_WAIT=3 + ASYNC_SUBMIT=1 -> CPU/GPU paralel calisir (3-4 FPS seri kilidi acilir),
+# Belobug PreludeUpload + release_tables + 720p RT + TX 512px ile VRAM < 6.0 GiB (Shared tasma sifir!).
 $env:VICTORY_RELAY                    = $relayMode
 $env:VICTORY_LATE_WAIT                = $lateWait
 $env:VICTORY_RELAY_COPY               = '1'
@@ -131,19 +128,19 @@ $env:VICTORY_HELD_LEVELS              = '1'
 $env:VICTORY_TEXTURE_NO_WAIT          = $texNoWait
 $env:VICTORY_TEXTURE_CATCHUP          = $texCatchup
 $env:VICTORY_TEXTURE_STAGE_MS         = $texStageMs
-$env:VICTORY_TEXTURE_MAX              = '1024'
+$env:VICTORY_TEXTURE_MAX              = $texMax
 $env:VICTORY_TEXTURE_BUDGET_MB        = $texBudgetMb
-$env:VICTORY_TEXTURE_ROOM_PERCENT     = '92'
+$env:VICTORY_TEXTURE_ROOM_PERCENT     = '84'
 $env:VICTORY_PANEL                    = '1'
-$env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1280'
+$env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
-$env:VICTORY_CARD_BUFFERS_MB          = '512'
+$env:VICTORY_CARD_BUFFERS_MB          = '384'
 $env:VICTORY_CARD_BUFFERS_MIN_MB      = '8'
-$env:VICTORY_WINDOW_BUDGET_MB         = '2048'
+$env:VICTORY_WINDOW_BUDGET_MB         = '768'
 $env:VICTORY_WINDOW_KB                = '1024'
 $env:VICTORY_WINDOW_TAILS             = '1'
-$env:VICTORY_RIPE_BLOCKS              = '2'
-$env:VICTORY_SEND_KEPT_MB             = '64'
+$env:VICTORY_RIPE_BLOCKS              = '1'
+$env:VICTORY_SEND_KEPT_MB             = '48'
 $env:VICTORY_DSTORAGE_STAGING_MB      = '128'
 $env:VICTORY_DSTORAGE_RETRIES         = '48'
 $env:VICTORY_DSTORAGE_PAGE_WAIT_MS    = '5000'

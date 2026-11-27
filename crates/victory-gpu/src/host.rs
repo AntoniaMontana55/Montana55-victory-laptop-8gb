@@ -181,15 +181,16 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    // On 8 GB cards (WDDM budget <= 9 GiB), start reclaiming earlier so sudden
-    // cutscene RT/UAV/geometry bursts never hit E_OUTOFMEMORY (0x8007000E).
+    // On 8 GB cards (WDDM budget <= 9 GiB, typically 6.6 GiB OS budget), start
+    // reclaiming early so Local VRAM never crosses the OS budget and triggers
+    // PCIe Shared RAM paging thrashing (5+ GiB shared spill / 3-4 FPS lock).
     if budget <= (9u64 << 30) {
-        if used < share(80) {
+        if used < share(72) {
             return (KEPT_MS, u64::MAX);
-        } else if used < share(90) {
-            return (IDLE_MS, used - share(72));
+        } else if used < share(84) {
+            return (IDLE_MS, used - share(64));
         } else {
-            return (TIGHT_SHORT_MS, used - share(72));
+            return (TIGHT_SHORT_MS, used - share(60));
         }
     }
     if used < share(88) {
@@ -575,10 +576,16 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let vmem = host().and_then(|h| h.video_memory());
+    let shared_spill = vmem.is_some_and(|[budget, used, _, shared]| {
+        (budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 86)
+            || shared >= (2560u64 << 20)
+    });
+    if crate::residency::pressured() || shared_spill {
         trim_spare_chunks();
+        crate::texture::trim_idle_now();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(vmem);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();

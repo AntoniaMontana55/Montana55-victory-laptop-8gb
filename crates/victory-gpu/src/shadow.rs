@@ -3134,13 +3134,20 @@ pub(crate) fn let_go_idle() {
         let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
         *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
         match *band {
-            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Calm => {
+                // On 16 GB hosts, proactively cap idle shared-RAM windows to
+                // `VICTORY_WINDOW_BUDGET_MB` before Commit climbs into paging.
+                if live_span_bytes() > bytes {
+                    idle_ms = idle_ms.min(4_000);
+                    keep = bytes;
+                }
+            }
             crate::host::RamBand::Watch => {
-                idle_ms = idle_ms.min(10_000);
+                idle_ms = idle_ms.min(5_000);
                 keep = bytes;
             }
             crate::host::RamBand::High => {
-                idle_ms = idle_ms.min(2_000);
+                idle_ms = idle_ms.min(1_500);
                 keep = bytes / 2;
             }
         }
