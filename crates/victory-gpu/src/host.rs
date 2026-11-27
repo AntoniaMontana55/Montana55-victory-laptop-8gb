@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -583,6 +583,7 @@ fn sweep() {
     });
     if crate::residency::pressured() || shared_spill {
         trim_spare_chunks();
+        trim_spare_uploads();
         send::trim_spare();
         if let Some(h) = host() {
             h.trim_preludes(8);
@@ -1322,6 +1323,46 @@ mod tests {
     }
 
     use super::*;
+
+    /// Whole upload buffers are kept by size class and given back to the
+    /// pool a list's deferred work holds them for ([`take_upload`]): a
+    /// second recording of the same size finds the buffer the first used,
+    /// not a new one, and `trim_spare_uploads` lets it go.
+    #[test]
+    fn whole_upload_buffers_are_kept_for_the_next_list() {
+        let Some(host) = crate::host::host() else { return };
+        let size = 4096u64;
+        // No device (or an adapter without D3D12): the pool simply makes
+        // nothing, and the test is done.
+        let Some(list) = host.new_list().ok() else { return };
+        // The first ask makes a buffer of the size class.
+        let first = list.upload(host, size).is_some();
+        let class = size.max(1).next_power_of_two();
+        {
+            let spare = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(spare.kept.len(), 0, "nothing is kept while a list holds it");
+        }
+        // Given back when the list's deferred work goes: kept by class.
+        drop(list);
+        let kept = {
+            let spare = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+            (spare.kept.len(), spare.bytes)
+        };
+        assert!(first, "an upload buffer was made");
+        assert_eq!(kept, (1, class), "the buffer is kept for the next list");
+        // The next of the same class finds it.
+        let again = host.new_list().ok().and_then(|l| l.upload(host, size));
+        assert!(again.is_some());
+        drop(again);
+        trim_spare_uploads();
+        {
+            let spare = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(spare.kept.is_empty(), "trim lets the kept buffers go");
+        }
+        // A plain device removal check: the pool broke nothing.
+        // SAFETY: a live device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -2477,6 +2518,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Whole upload buffers taken from a pool ([`take_upload`]), given back
+    /// to it when the list is reset or dropped.
+    pooled: Vec<(Uploaded, u64, UploadKind)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2520,6 +2564,120 @@ struct Deferred {
     indirect_readable: usize,
 }
 
+/// A mapped whole upload buffer, kept for the next list's upload when a
+/// list is done with it (`Spare`, as scratch chunks are).
+struct Uploaded {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping, held
+// by the deferred work of one list at a time.
+unsafe impl Send for Uploaded {}
+
+/// A buffer's size class: the power of two of at least the size asked
+/// (`HostList::upload` sizes differ from recording to recording; kept by
+/// class, the next of about a size finds the one before it). The class also
+/// says which pool a buffer belongs to: the write-back shared buffers the
+/// card's steps fill from ([`Host::shared_buffer`]) are a different heap
+/// from the upload ones, and never cross.
+#[derive(Clone, Copy, PartialEq)]
+enum UploadKind {
+    Upload,
+    Shared,
+}
+
+/// Whole upload buffers of no list's, kept for whoever next asks for one
+/// (`HostList::upload`): whole-texture zeros and footprint-copy sources,
+/// which before were a committed buffer each, made and freed for every
+/// recording (run 60: 42,607 of them, 77.9 GB, in five minutes, the churn
+/// behind the 0x8007000E crashes of a 16 GiB host).
+static UPLOADS: Mutex<Spare<Uploaded>> = Mutex::new(Spare::new());
+/// The same of the write-back shared buffers.
+static SHARES: Mutex<Spare<Uploaded>> = Mutex::new(Spare::new());
+
+/// The most bytes of whole upload buffers kept while no list holds them
+/// (each pool). `VICTORY_UPLOAD_KEPT_MB` caps it (0: the pools are off).
+fn uploads_kept() -> u64 {
+    static KEPT: OnceLock<u64> = OnceLock::new();
+    *KEPT.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_KEPT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(64u64 << 20, |mb| mb.min(2048) << 20)
+    })
+}
+
+/// A whole buffer of the class of `kind`, of `size` bytes or more (the
+/// size class it was made at comes back with it), mapped: one kept (a pool
+/// hit: it was made for a recording of this size class and given back) or
+/// a new one.
+fn take_upload(host: &Host, size: u64, kind: UploadKind) -> Option<(Uploaded, u64)> {
+    let size = size.max(1).next_power_of_two();
+    let pool = match kind {
+        UploadKind::Upload => &UPLOADS,
+        UploadKind::Shared => &SHARES,
+    };
+    if let Some(taken) = pool.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+        return Some((taken, size));
+    }
+    let (buffer, data) = match kind {
+        UploadKind::Upload => host.upload_buffer(size)?,
+        UploadKind::Shared => host.shared_buffer(size)?,
+    };
+    name(&buffer, || format!("list upload {size:#x}"));
+    ALIVE[6].fetch_add(1, Ordering::Relaxed);
+    ALIVE[7].fetch_add(size, Ordering::Relaxed);
+    Some((Uploaded { buffer, data: data as usize }, size))
+}
+
+/// A list is done with `taken` (reset after its submissions ran, or
+/// dropped): kept for the next list, or freed past [`uploads_kept`].
+fn give_uploads(taken: Vec<(Uploaded, u64, UploadKind)>) {
+    if taken.is_empty() {
+        return;
+    }
+    let mut freed: Vec<Uploaded> = Vec::new();
+    {
+        let mut upload = UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut shared = SHARES.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = uploads_kept();
+        for (buffer, size, kind) in taken {
+            // `give` hands the buffer back when the pool is full or off:
+            // freed outside the locks below.
+            let not_kept = match kind {
+                UploadKind::Upload => upload.give(buffer, size, limit),
+                UploadKind::Shared => shared.give(buffer, size, limit),
+            };
+            if let Some(buffer) = not_kept {
+                ALIVE[6].fetch_sub(1, Ordering::Relaxed);
+                ALIVE[7].fetch_sub(size, Ordering::Relaxed);
+                freed.push(buffer);
+            }
+        }
+    }
+    drop(freed);
+}
+
+/// Lets go of the whole buffers both pools keep idle, when the system is
+/// short of memory (the sweep, `emergency_evict`).
+fn trim_spare_uploads() {
+    let mut freed = Vec::new();
+    for pool in [&UPLOADS, &SHARES] {
+        let mut spare = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            continue;
+        }
+        spare.bytes = 0;
+        freed.extend(std::mem::take(&mut spare.kept));
+    }
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| s).sum();
+    ALIVE[6].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[7].fetch_sub(bytes, Ordering::Relaxed);
+    drop(freed);
+}
+
 impl Deferred {
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
@@ -2528,6 +2686,14 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// Holds a pooled whole upload buffer ([`take_upload`]) until the list
+    /// is reset or dropped, then kept again for the next list. (Its
+    /// aliveness is counted by the pool from its making to its freeing;
+    /// [`Deferred::upload_bytes`] is the unpooled ones' alone.)
+    fn hold_pooled(&mut self, upload: Uploaded, size: u64, kind: UploadKind) {
+        self.pooled.push((upload, size, kind));
     }
 
     /// The steps recorded last write title memory: what was brought up to
@@ -2543,6 +2709,9 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // The pooled whole buffers go back for the next list (the list is
+        // dropped only after its submissions have run, or never sent).
+        give_uploads(std::mem::take(&mut self.pooled));
     }
 }
 
@@ -6745,28 +6914,51 @@ impl HostList {
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
-            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-                crate::residency::allocation_error(&e);
+        if let Err(first) = unsafe { self.list.Close() } {
+            if first.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                crate::residency::allocation_error(&first);
                 if let Some(h) = host() {
                     h.emergency_evict();
                 }
-                let ram = ram_sample().map(|(w, p, f, c, t, _)| {
-                    format!(
-                        " [RAM used {:.1}/{:.1} GiB, proc commit {:.1} GiB, working {:.1} GiB, avail commit {:.1} GiB]",
-                        t.saturating_sub(f) as f64 / (1u64 << 30) as f64,
-                        t as f64 / (1u64 << 30) as f64,
-                        p as f64 / (1u64 << 30) as f64,
-                        w as f64 / (1u64 << 30) as f64,
-                        c as f64 / (1u64 << 30) as f64,
-                    )
-                }).unwrap_or_default();
-                fail(format_args!(
-                    "a host command list did not close ({e}){ram}: command allocator ran out of memory"
-                ));
+                // Idle lists, preludes and staging freed: the close is tried
+                // once more before the run ends (the last runs' crashes were
+                // this failure, under the WDDM shared GPU memory cap of a
+                // 16 GiB host, with commit to spare). CLAUDE.txt: return an
+                // error frame rather than crash.
+                // SAFETY: our list; a close that failed left it open, and a
+                // second failure ends the run below as before.
+                if let Err(e) = unsafe { self.list.Close() } {
+                    if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                        let ram = ram_sample().map(|(w, p, f, c, t, _)| {
+                            format!(
+                                " [RAM used {:.1}/{:.1} GiB, proc commit {:.1} GiB, working {:.1} GiB, avail commit {:.1} GiB]",
+                                t.saturating_sub(f) as f64 / (1u64 << 30) as f64,
+                                t as f64 / (1u64 << 30) as f64,
+                                p as f64 / (1u64 << 30) as f64,
+                                w as f64 / (1u64 << 30) as f64,
+                                c as f64 / (1u64 << 30) as f64,
+                            )
+                        }).unwrap_or_default();
+                        fail(format_args!(
+                            "a host command list did not close ({e}){ram}: command allocator ran out of memory"
+                        ));
+                    }
+                    fail(format_args!(
+                        "a host command list did not close ({e}): a command recorded into it was invalid"
+                    ));
+                }
+                static RECOVERED: AtomicU64 = AtomicU64::new(0);
+                let n = RECOVERED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_multiple_of(64) {
+                    tracing::warn!(
+                        times = n,
+                        "a host command list closed after an emergency eviction (command allocator had run out of memory)"
+                    );
+                }
+                return;
             }
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
+                "a host command list did not close ({first}): a command recorded into it was invalid"
             ));
         }
     }
@@ -7479,16 +7671,23 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// A mapped upload buffer of `size` bytes (the size class's), alive
+    /// until the list is reset.
     ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// The buffer is kept for the next recording once this list is done
+    /// (reset after its submissions ran, or dropped): before, a committed
+    /// buffer was made for every recording and freed again — 42,607 of
+    /// them, 77.9 GB, in five minutes of run 60, the churn behind the
+    /// 0x8007000E crashes of a 16 GiB host.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+        let kind = if card_steps::stage() > 1 { UploadKind::Shared } else { UploadKind::Upload };
+        let (taken, at) = take_upload(host, size, kind)?;
+        let Uploaded { buffer, data } = taken;
+        // The deferred work holds the buffer until the list is done; the
+        // caller's own reference is a clone of it.
+        self.deferred()
+            .hold_pooled(Uploaded { buffer: buffer.clone(), data }, at, kind);
+        Some((buffer, data as *mut u8))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -9494,6 +9693,7 @@ impl Host {
             // Tier 1: no resident texture loses its memory (no
             // `evict_emergency`: its texture evictions are tier 2's).
             trim_spare_chunks();
+            trim_spare_uploads();
             send::trim_spare();
             self.trim_preludes(4);
             crate::list::trim_idle(16);
@@ -9514,6 +9714,7 @@ impl Host {
             return;
         }
         trim_spare_chunks();
+        trim_spare_uploads();
         send::trim_spare();
         self.trim_preludes(2);
         crate::list::trim_idle(8);

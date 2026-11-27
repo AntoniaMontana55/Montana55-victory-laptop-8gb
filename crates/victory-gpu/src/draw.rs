@@ -1461,15 +1461,36 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
+        // Diagnostics: the model-load question (CLAUDE.txt task 5): a slot
+        // the pipeline reads that has no buffer, or one outside every host
+        // copy, is why a draw fires with no geometry. First few named, then
+        // every power of two.
+        static NO_BUFFER: AtomicU64 = AtomicU64::new(0);
+        static NO_SHADOW: AtomicU64 = AtomicU64::new(0);
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
             }
             count = slot + 1;
             if v.address == 0 || v.size == 0 {
+                let n = NO_BUFFER.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    eprintln!(
+                        "[diag] vertex slot {slot} read by the pipeline has no buffer bound (draw {n}: runs without its geometry)"
+                    );
+                }
                 continue;
             }
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                let n = NO_SHADOW.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    eprintln!(
+                        "[diag] vertex buffer {:#x}+{} (stride {}) lies outside every host copy (draw {n}: runs without its geometry)",
+                        v.address,
+                        v.size,
+                        v.stride
+                    );
+                }
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
