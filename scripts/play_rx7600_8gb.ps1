@@ -26,27 +26,27 @@ if (-not (Test-Path $gameExe)) {
     exit 1
 }
 
-# Arka planda acik kalmis eski victory surecini kapat
-Stop-Process -Name 'victory' -Force -ErrorAction SilentlyContinue
+# Arka planda acik kalmis eski victory ve RAM yiyen uygulamalari otomatik kapat
+Stop-Process -Name 'victory','Spotify','Discord','brave','chrome' -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
 # Eski VICTORY_* degiskenlerini temizle
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
 # Sabit Profil (Menu yok, tek tik):
-# Varsayilan 2 = RX 7600 8GB SIFIR TASMA + 30 FPS + TAM MODEL (720p RT tasarrufu, RELAY=2, TX<=1.5GB)
-# Profil 1     = 936p YUKSEK COZUNURLUK (1664x936 x0.6667 | daha yuksek netlik, ~350MB fazla RT)
+# Varsayilan 2 = 1920x1080 FULL HD + 30 FPS + TAM MODEL (RELAY=2, TX<=1.4GB, 512px)
+# Profil 1     = 1280x720 HAFIF (Maks FPS / En dusuk VRAM)
 if ($Profile -eq '1') {
-    $profileName     = '1 - 936p NET (1664x936 x0.6667 | RELAY=2 | %100 Saf Shader)'
-    $outputMode      = '1664x936'
-    $renderScale     = '0.6667'
-    $texBudgetMb     = '1408'
-    $texMax          = '512'
-} else {
-    $profileName     = '2 - SIFIR TASMA + 30 FPS + TAM MODEL (1280x720 x0.6667 | RELAY=2 | TX 512px)'
+    $profileName     = '1 - 720p MAKS FPS (1280x720 x0.6667 | RELAY=2 | %100 Saf Shader)'
     $outputMode      = '1280x720'
     $renderScale     = '0.6667'
     $texBudgetMb     = '1536'
+    $texMax          = '512'
+} else {
+    $profileName     = '2 - 1080p FULL HD + TAM MODEL (1920x1080 x0.6667 | RELAY=2 | TX 512px)'
+    $outputMode      = '1920x1080'
+    $renderScale     = '0.6667'
+    $texBudgetMb     = '1408'
     $texMax          = '512'
 }
 $relayMode       = '2'
@@ -162,19 +162,11 @@ Write-Host "                           C L A W Z   G T A   V I                  
 Write-Host "         RX 7600 8GB | %100 Saf DXIL + Tam Model + PRELUDE_RING             " -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil    : $profileName" -ForegroundColor Green
-Write-Host "  Shader    : %100 Saf DXIL (PORT_CBV=0 | BVH_MISS=0 | RT_RESOLVE=ON | Mor Filtre)" -ForegroundColor Yellow
-Write-Host "  Modeller  : Senkron Yukleme + CATCHUP=1 + NO_WAIT=0 + 2560MB + 128MB/48-Retry" -ForegroundColor Cyan
+Write-Host "  Shader    : %100 Saf DXIL (AMBIENT=0.85 | AIR=0.25 | RT_SKIP + CUTSCENE_FAST)" -ForegroundColor Yellow
+Write-Host "  Modeller  : Cilt Bake Korumasi + CATCHUP=1 + TX 512px + 128MB/48-Retry" -ForegroundColor Cyan
 Write-Host "  HUD       : Sol Ust FPS / Grafik / VRAM / CPU / RAM ACIK (F3 ile ac/kapa)" -ForegroundColor Magenta
-Write-Host "  Koruma    : PRELUDE_RING + Belobug Prelude Upload + Pool Batch + BURY_LAG=64" -ForegroundColor Cyan
+Write-Host "  RAM/VRAM  : Spotify/Discord/Brave/Chrome otomatik kapatildi + PRELUDE_RING" -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
-
-$hogs = Get-Process Discord,Spotify,brave,chrome -ErrorAction SilentlyContinue | Group-Object Name | ForEach-Object {
-    $mb = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB, 0)
-    if ($mb -ge 250) { "$($_.Name): ${mb}MB" }
-}
-if ($hogs) {
-    Write-Host "  [UYARI] Arka planda RAM yiyenler: $($hogs -join ', ') (kapatirsan RAM cok rahatlar!)" -ForegroundColor Red
-}
 Write-Host ""
 
 Push-Location $repo

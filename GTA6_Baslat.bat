@@ -14,5 +14,7 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
+taskkill /F /IM Spotify.exe /IM Discord.exe /IM brave.exe /IM chrome.exe >nul 2>&1
+
 powershell -NoProfile -ExecutionPolicy Bypass -NoExit -File "%PS1%" -Profile %PROF%
 endlocal
