@@ -312,12 +312,15 @@ void gather(uint3 at : SV_DispatchThreadID) {
         blue += w * L.b * dir;
     }
     whole = max(whole, 1e-6);
-    light /= whole;
+    light = sanitize_probe(light / whole);
     toward /= whole;
     uint at0 = (at.y * PX + at.x) * 3;
-    points[at0] = float4(red / whole - light.r * toward, light.r);
-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    float3 sr_dir = (any(isnan(red)) || any(isinf(red))) ? float3(0, 0, 0) : (red / whole - light.r * toward);
+    float3 sg_dir = (any(isnan(green)) || any(isinf(green))) ? float3(0, 0, 0) : (green / whole - light.g * toward);
+    float3 sb_dir = (any(isnan(blue)) || any(isinf(blue))) ? float3(0, 0, 0) : (blue / whole - light.b * toward);
+    points[at0] = float4(sr_dir, light.r);
+    points[at0 + 1] = float4(sg_dir, light.g);
+    points[at0 + 2] = float4(sb_dir, light.b);
 }
 #endif
 
@@ -394,7 +397,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
     if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
         float sum = 0.0;
-        const int N = 12;
+        const int N = 6;
         for (int i = 0; i < N; i++) {
             float a = i * 2.399963 + noise * 6.2831853;
             float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
@@ -406,8 +409,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
-    float hemi_open = lerp(0.48, 1.0, open);
-    float3 hemi_tint = lerp(float3(0.26, 0.25, 0.24), float3(0.36, 0.35, 0.33), saturate(n.y * 0.5 + 0.5));
+    float hemi_open = lerp(0.55, 1.0, open);
+    float3 hemi_tint = lerp(float3(0.32, 0.30, 0.29), float3(0.46, 0.44, 0.42), saturate(n.y * 0.5 + 0.5));
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * hemi_open;
         float3 clean_was = clamp(sanitize_probe(unpack(light[p])), 0.0, 64.0);
@@ -435,12 +438,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    // Hemisphere night/indoor ambient floor (never collapses to 0 in creases
-    // so characters like Lucia stay lit instead of black silhouettes) + full
-    // RDNA 3 NaN/Inf/magenta/neon-green probe sanitization.
+    float3 room_mean = sanitize_probe(cells[CELLS].rgb);
+    found = lerp(found, room_mean, 0.2) * level * open;
+    // Exposure-aware hemisphere night/indoor ambient floor (never collapses to
+    // 0 in creases or high-contrast indoor/car/TV shots so character heads and
+    // skin stay lit instead of black silhouettes) + RDNA 3 NaN/Inf/green filter.
     found = sanitize_probe(found);
-    float3 night_floor = hemi_tint * level * hemi_open;
+    float3 night_floor = max(hemi_tint, room_mean * 0.22) * level * hemi_open;
     found = max(found, night_floor);
     float3 was = sanitize_probe(unpack(light[p]));
     float left = dot(was, LUMA);

@@ -2299,7 +2299,24 @@ impl State {
         let mut room = crate::resource::room(memory);
         if baking && !room {
             let _ = crate::resource::evict_emergency(256 << 20);
+            crate::pool::emergency_reclaim();
             room = true;
+        } else if !room {
+            // Proactively evict oldest large Dynamic world textures once per
+            // second when `!room` so newly-streamed character faces and LOD0
+            // assets are never permanently starved behind stale background maps.
+            static LAST_RECLAIM_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = crate::host::now_ms();
+            let prev = LAST_RECLAIM_MS.load(Ordering::Relaxed);
+            if now_ms >= prev + 1000
+                && LAST_RECLAIM_MS.compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let freed = crate::resource::evict_emergency(192 << 20);
+                crate::pool::emergency_reclaim();
+                if freed > 0 {
+                    room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                }
+            }
         }
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
@@ -2311,6 +2328,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let mut critical_admitted = 0u32;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2538,7 +2556,18 @@ impl State {
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                // Priority tier: never leave small character face/eye/skin/detail
+                // textures (<= 512 KiB) black behind stale large world textures.
+                let critical_small = !has_its_texture
+                    && critical_admitted < 32
+                    && there.is_some_and(|bytes| bytes <= (512u64 << 10))
+                    && !crate::residency::critical_commit();
+                if critical_small {
+                    critical_admitted += 1;
+                    if critical_admitted == 1 {
+                        let _ = crate::resource::evict_emergency(64 << 20);
+                    }
+                } else if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -2552,14 +2581,15 @@ impl State {
                         break;
                     }
                     continue;
-                }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                } else {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
             // (`VICTORY_RESIDENCY=1`: no new host texture or staging while
@@ -2816,15 +2846,23 @@ impl State {
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            if crate::pipeline::is_left_out(self.pipeline as This) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::pipeline::note_drop(self.pipeline as This);
+                    self.list_dropped_roots([x, y, z]);
+                }
+                return;
+            }
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"

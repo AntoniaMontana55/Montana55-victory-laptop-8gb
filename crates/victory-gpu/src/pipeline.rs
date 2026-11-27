@@ -467,6 +467,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Whether a title pipeline was intentionally left out (`VICTORY_RT_SKIP_*` /
+/// `VICTORY_CUTSCENE_FAST`), as opposed to missing or failed to compile.
+#[cfg(windows)]
+pub(crate) fn is_left_out(this: This) -> bool {
+    !this.is_null() && pipeline(this).host.is_left_out()
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

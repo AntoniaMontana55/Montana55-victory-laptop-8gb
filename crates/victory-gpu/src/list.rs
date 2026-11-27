@@ -241,6 +241,35 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Effective idle host-list pool ceiling: 16 GB RAM hosts keep at most 64 idle
+/// `ID3D12CommandAllocator`s (instead of 512) so peak DMA command buffers never
+/// balloon Local/Other VRAM (`O 2.5 GiB`) or process commit (`19.2 GiB`).
+#[cfg(windows)]
+fn idle_most() -> (usize, u64) {
+    if crate::residency::limited_host_ram() {
+        (64, 64 << 20)
+    } else {
+        IDLE_MOST
+    }
+}
+
+/// Non-blocking trim of idle command lists/allocators down to `keep` entries.
+/// Safe to call from sweeps, memory safety valves, and `E_OUTOFMEMORY` recovery.
+#[cfg(windows)]
+pub(crate) fn trim_idle(keep: usize) {
+    let Ok(mut idle) = IDLE.try_lock() else {
+        return;
+    };
+    if idle.0.len() <= keep {
+        return;
+    }
+    let dropped: Vec<Idle> = idle.0.drain(keep..).collect();
+    let freed_bytes: u64 = dropped.iter().map(|i| i.1).sum();
+    idle.1 = idle.1.saturating_sub(freed_bytes);
+    drop(idle);
+    drop(dropped);
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -280,7 +309,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let (most_lists, most_bytes) = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most_lists {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -288,7 +318,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most_lists && idle.1 + bytes <= most_bytes {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

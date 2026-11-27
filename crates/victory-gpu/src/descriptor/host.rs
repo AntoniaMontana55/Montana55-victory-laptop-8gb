@@ -3403,7 +3403,11 @@ impl HostHeap {
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
             let kept = if later {
-                None
+                if !self.sampler && is_texture_view(&view) {
+                    neutral_for(&view, self.at(index)).map(Some)
+                } else {
+                    None
+                }
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };

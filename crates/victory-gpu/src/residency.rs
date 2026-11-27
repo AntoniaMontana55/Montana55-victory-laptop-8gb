@@ -136,9 +136,11 @@ pub(crate) fn refresh() {
     }
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
+    let sys_used = status.ullTotalPhys.saturating_sub(physical);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let tight_16g = status.ullTotalPhys <= 20 * GIB && sys_used >= (12 * GIB + (512 << 20));
+    let pressure = tight_16g || next_pressure(was, physical, commit);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {

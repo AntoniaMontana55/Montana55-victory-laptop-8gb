@@ -164,6 +164,10 @@ impl Pending {
         &self.key
     }
 
+    pub(super) fn is_left_out(&self) -> bool {
+        self.left_out.is_some()
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");

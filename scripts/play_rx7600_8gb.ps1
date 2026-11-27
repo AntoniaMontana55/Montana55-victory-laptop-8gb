@@ -34,27 +34,27 @@ Start-Sleep -Milliseconds 300
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
 # Sabit Profil (Menu yok, tek tik):
-# Varsayilan 2 = 1920x1080 FULL HD + 30 FPS + TAM MODEL (RELAY=2, TX<=1.4GB, 512px)
+# Varsayilan 2 = 1920x1080 FULL HD + 30 FPS + TAM MODEL (RELAY=2, 16MiB Pool, BURY_LAG=8)
 # Profil 1     = 1280x720 HAFIF (Maks FPS / En dusuk VRAM)
 if ($Profile -eq '1') {
-    $profileName     = '1 - 720p MAKS FPS (1280x720 x0.6667 | RELAY=2 | %100 Saf Shader)'
+    $profileName     = '1 - 720p MAKS FPS (1280x720 x0.70 | RELAY=2 | %100 Saf Shader)'
     $outputMode      = '1280x720'
-    $renderScale     = '0.6667'
+    $renderScale     = '0.70'
     $texBudgetMb     = '1536'
     $texMax          = '512'
 } else {
-    $profileName     = '2 - 1080p FULL HD + TAM MODEL (1920x1080 x0.6667 | RELAY=2 | TX 512px)'
+    $profileName     = '2 - 1080p FULL HD + TAM MODEL (1920x1080 x0.70 | RELAY=2 | 16MiB Pool)'
     $outputMode      = '1920x1080'
-    $renderScale     = '0.6667'
-    $texBudgetMb     = '1408'
+    $renderScale     = '0.70'
+    $texBudgetMb     = '1536'
     $texMax          = '512'
 }
 $relayMode       = '2'
 $lateWait        = '3'
 $asyncSubmit     = '1'
-$texNoWait       = '1'
+$texNoWait       = '0'
 $texCatchup      = '1'
-$texStageMs      = '250'
+$texStageMs      = '200'
 $pipelineWaitMs  = '1500'
 
 # === %100 SAF STANDART DXIL SHADER (25.694 ONBELLEKLE %100 UYUMLU) ===
@@ -118,15 +118,16 @@ $env:VICTORY_QUICK_FIND               = '1'
 $env:VICTORY_VIEW_BYTES               = '1'
 $env:VICTORY_DYNAMIC_SLOTS            = '524288'
 
-# === 8 GB VRAM + 16 GB RAM BELLEK & MESH ONCELIGI ===
-# LEVELS_ON_DEMAND=0 + HELD_LEVELS=1 + TEXTURE_NO_WAIT=0 + TEXTURE_CATCHUP=1
-# -> Siyah karo ve yarim yuklu model yok, 3x catchup + dinamik VRAM mip-drop aktif!
-# BURY_LAG=64 + PRELUDE_RING -> 0x887A0001 ve "no host list for a state prelude" sifir!
+# === 8 GB VRAM + 16 GB RAM BELLEK, ANTI-OOM & MESH ONCELIGI ===
+# BURY_LAG=8 + KEEP_FREED=0 + WINDOW_BUDGET=512MB/512KB + SNAPSHOT_POOL=64
+# -> COMMIT 19.2GB / SHARED 6.4GB / O 2.5GB sismesi ve 0x8007000E cokmesi kokten kapanir!
+# CARD_BUFFERS_MB=512 (MIN=4MB) -> CPU snapshot/compare yuku (SUB 318ms) GPU VRAM'e tasinir!
+# TEXTURE_NO_WAIT=0 + 16MiB havuz -> siyah yuz / bos karo ve TX 2.5GB kilitlenmesi biter!
 $env:VICTORY_RESIDENCY                = '1'
 $env:VICTORY_RESIDENCY_LIMITED        = '1'
-$env:VICTORY_KEEP_FREED               = '1'
-$env:VICTORY_BURY_LAG                 = '64'
-$env:VICTORY_SUBMIT_CHUNK             = '8'
+$env:VICTORY_KEEP_FREED               = '0'
+$env:VICTORY_BURY_LAG                 = '8'
+$env:VICTORY_SUBMIT_CHUNK             = '6'
 $env:VICTORY_LEVELS_ON_DEMAND         = '0'
 $env:VICTORY_HELD_LEVELS              = '1'
 $env:VICTORY_TEXTURE_NO_WAIT          = $texNoWait
@@ -134,17 +135,18 @@ $env:VICTORY_TEXTURE_CATCHUP          = $texCatchup
 $env:VICTORY_TEXTURE_STAGE_MS         = $texStageMs
 $env:VICTORY_TEXTURE_MAX              = $texMax
 $env:VICTORY_TEXTURE_BUDGET_MB        = $texBudgetMb
-$env:VICTORY_TEXTURE_ROOM_PERCENT     = '84'
+$env:VICTORY_TEXTURE_ROOM_PERCENT     = '85'
 $env:VICTORY_PANEL                    = '1'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
-$env:VICTORY_CARD_BUFFERS_MB          = '384'
-$env:VICTORY_CARD_BUFFERS_MIN_MB      = '8'
-$env:VICTORY_WINDOW_BUDGET_MB         = '768'
-$env:VICTORY_WINDOW_KB                = '1024'
+$env:VICTORY_CARD_BUFFERS_MB          = '512'
+$env:VICTORY_CARD_BUFFERS_MIN_MB      = '4'
+$env:VICTORY_WINDOW_BUDGET_MB         = '512'
+$env:VICTORY_WINDOW_KB                = '512'
 $env:VICTORY_WINDOW_TAILS             = '1'
+$env:VICTORY_SNAPSHOT_POOL            = '64'
 $env:VICTORY_RIPE_BLOCKS              = '1'
-$env:VICTORY_SEND_KEPT_MB             = '48'
+$env:VICTORY_SEND_KEPT_MB             = '32'
 $env:VICTORY_DSTORAGE_STAGING_MB      = '128'
 $env:VICTORY_DSTORAGE_RETRIES         = '48'
 $env:VICTORY_DSTORAGE_PAGE_WAIT_MS    = '5000'

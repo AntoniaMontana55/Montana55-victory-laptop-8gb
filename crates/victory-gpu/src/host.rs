@@ -578,12 +578,21 @@ fn sweep() {
     crate::residency::refresh();
     let vmem = host().and_then(|h| h.video_memory());
     let shared_spill = vmem.is_some_and(|[budget, used, _, shared]| {
-        (budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 86)
-            || shared >= (2560u64 << 20)
+        (budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 84)
+            || shared >= (1536u64 << 20)
     });
     if crate::residency::pressured() || shared_spill {
         trim_spare_chunks();
+        send::trim_spare();
+        if let Some(h) = host() {
+            h.trim_preludes(8);
+        }
+        crate::list::trim_idle(32);
+        crate::shadow::trim_pool();
         crate::texture::trim_idle_now();
+    }
+    if let Some(h) = host() {
+        h.memory_safety_valve();
     }
     crate::pool::room(vmem);
     crate::pipeline::trim_library();
@@ -635,7 +644,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        let default = if crate::residency::limited_host_ram() { 8 } else { 64 };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
 }
@@ -647,10 +656,15 @@ fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     bury_up_to(finished);
     // Immediately reclaim finished idle `D3D12_HEAP_TYPE_UPLOAD` staging
-    // buffers when upload usage exceeds 256 MiB or host RAM is pressured so
+    // buffers when upload usage exceeds 128 MiB or host RAM is pressured so
     // 16 GB systems stay below 12 GB RAM.
-    if crate::residency::pressured() || crate::texture::live_staging_bytes() > (256u64 << 20) {
+    if crate::residency::pressured() || crate::texture::live_staging_bytes() > (128u64 << 20) {
         crate::texture::trim_idle_now();
+    }
+    if finished.is_multiple_of(30)
+        && let Some(h) = host()
+    {
+        h.memory_safety_valve();
     }
 }
 
@@ -4264,7 +4278,14 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let mut list = self.make_list();
+        if let Err(e) = &list
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            list = self.make_list();
+        }
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -4361,6 +4382,40 @@ impl Host {
         for prelude in preludes {
             ring.push_back((fence_value, prelude));
         }
+        // Cap idle completed preludes so command allocators never grow unboundedly.
+        let max_idle = if crate::residency::limited_host_ram() { 16 } else { 48 };
+        if ring.len() > max_idle {
+            // SAFETY: plain fence progress query.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            let mut dropped = Vec::new();
+            while ring.len() > max_idle && ring.front().is_some_and(|(fv, _)| *fv <= completed) {
+                if let Some((_, p)) = ring.pop_front() {
+                    dropped.push(p);
+                }
+            }
+            drop(ring);
+            drop(dropped);
+        }
+    }
+
+    /// Non-blocking trim of GPU-completed idle preludes in `prelude_ring` down to `keep`.
+    fn trim_preludes(&self, keep: usize) {
+        let Ok(mut ring) = self.prelude_ring.try_lock() else {
+            return;
+        };
+        if ring.len() <= keep {
+            return;
+        }
+        // SAFETY: plain fence progress query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let mut dropped = Vec::new();
+        while ring.len() > keep && ring.front().is_some_and(|(fv, _)| *fv <= completed) {
+            if let Some((_, p)) = ring.pop_front() {
+                dropped.push(p);
+            }
+        }
+        drop(ring);
+        drop(dropped);
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
@@ -6687,6 +6742,25 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                crate::residency::allocation_error(&e);
+                if let Some(h) = host() {
+                    h.emergency_evict();
+                }
+                let ram = ram_sample().map(|(w, p, f, c, t, _)| {
+                    format!(
+                        " [RAM used {:.1}/{:.1} GiB, proc commit {:.1} GiB, working {:.1} GiB, avail commit {:.1} GiB]",
+                        t.saturating_sub(f) as f64 / (1u64 << 30) as f64,
+                        t as f64 / (1u64 << 30) as f64,
+                        p as f64 / (1u64 << 30) as f64,
+                        w as f64 / (1u64 << 30) as f64,
+                        c as f64 / (1u64 << 30) as f64,
+                    )
+                }).unwrap_or_default();
+                fail(format_args!(
+                    "a host command list did not close ({e}){ram}: command allocator ran out of memory"
+                ));
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -9353,8 +9427,40 @@ impl Host {
         }
     }
 
+    /// Proactive memory safety valve: monitors DXGI local/shared VRAM and
+    /// process/system RAM, reclaiming idle command allocators, preludes,
+    /// snapshot pools, loose shared-RAM windows, staging buffers and stale
+    /// world textures BEFORE Windows hits `E_OUTOFMEMORY` (`0x8007000E`).
+    pub(crate) fn memory_safety_valve(&self) {
+        const GIB: u64 = 1 << 30;
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let prev = LAST_MS.load(Ordering::Relaxed);
+        if now < prev + 250 || LAST_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let ram_trip = ram_sample().is_some_and(|(_, private, free_phys, avail_commit, total_phys, _)| {
+            let sys_used = total_phys.saturating_sub(free_phys);
+            private >= (13 * GIB + (512 << 20))
+                || (total_phys <= 20 * GIB && sys_used >= (12 * GIB + (512 << 20)))
+                || avail_commit < (2 * GIB + (512 << 20))
+        });
+        let vram_trip = self.video_memory().is_some_and(|[budget, used, _, shared]| {
+            let cap = if budget > 0 && budget <= 9 * GIB {
+                budget.saturating_sub(512 << 20).min(6246 << 20)
+            } else {
+                budget / 100 * 92
+            };
+            (budget > 0 && used >= cap) || shared >= 2 * GIB
+        });
+        if ram_trip || vram_trip {
+            self.emergency_evict();
+        }
+    }
+
     /// Emergency non-blocking VRAM/RAM reclamation invoked on `E_OUTOFMEMORY`
-    /// (`0x8007000E`) before retrying critical buffer/UAV/texture allocations.
+    /// (`0x8007000E`) or when [`memory_safety_valve`] trips before critical
+    /// allocator/buffer/UAV/texture allocations can fail.
     pub(crate) fn emergency_evict(&self) {
         static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if EVICTING.swap(true, Ordering::AcqRel) {
@@ -9362,15 +9468,19 @@ impl Host {
         }
         trim_spare_chunks();
         send::trim_spare();
+        self.trim_preludes(2);
+        crate::list::trim_idle(8);
         crate::texture::trim_idle_now();
+        crate::shadow::trim_pool();
+        crate::shadow::trim_loose_now();
         crate::shadow::trim_exact();
         crate::pool::emergency_reclaim();
-        let evicted = crate::resource::evict_emergency(256 << 20);
+        let evicted = crate::resource::evict_emergency(384 << 20);
         // Drop completed retired GPU resources keeping a minimal 4-submission
         // safety margin for in-flight recorded lists.
         bury_up_to(FINISHED.load(Ordering::Acquire).saturating_sub(4));
         if evicted > 0 {
-            trail(|| format!("emergency_evict: reclaimed {} KiB of idle textures after E_OUTOFMEMORY", evicted >> 10));
+            trail(|| format!("emergency_evict: reclaimed {} KiB of idle textures", evicted >> 10));
         }
         EVICTING.store(false, Ordering::Release);
     }
@@ -9396,6 +9506,7 @@ struct Presenter {
     height: u32,
     format: DXGI_FORMAT,
     tearing: bool,
+    waitable: bool,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -9886,6 +9997,7 @@ impl Host {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
+            let resize_flags = (if p.tearing { 0x800 } else { 0 }) | (if p.waitable { 0x40 } else { 0 });
             let resized = unsafe {
                 p.swap_chain
                     .ResizeBuffers(
@@ -9893,7 +10005,7 @@ impl Host {
                         width,
                         height,
                         format,
-                        DXGI_SWAP_CHAIN_FLAG(if p.tearing { 0x800 } else { 0 }),
+                        DXGI_SWAP_CHAIN_FLAG(resize_flags),
                     )
             };
             match resized {
@@ -10117,6 +10229,9 @@ impl Host {
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+                if frame.is_multiple_of(30) {
+                    self.memory_safety_valve();
+                }
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
@@ -10195,6 +10310,7 @@ impl Host {
                 height,
                 format,
                 tearing,
+                waitable,
                 copy,
                 ahead: Vec::new(),
                 hwnd,

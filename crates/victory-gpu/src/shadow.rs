@@ -1322,20 +1322,35 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_bytes: usize = if crate::residency::limited_host_ram() {
+        64 << 20
+    } else {
+        512 << 20
+    };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_bytes {
             break;
         }
         kept += 1;
     }
     // (Given back to the kernel without the lock: milliseconds.)
     let gone = pool.split_off(kept);
+    drop(pool);
+    drop(gone);
+}
+
+/// Immediately releases all idle CPU snapshot buffers held in [`POOL`] on
+/// memory pressure or `E_OUTOFMEMORY` without blocking.
+pub(crate) fn trim_pool() {
+    let Ok(mut pool) = POOL.try_lock() else {
+        return;
+    };
+    let gone = std::mem::take(&mut *pool);
     drop(pool);
     drop(gone);
 }
@@ -3123,11 +3138,57 @@ static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
+/// Total unique bytes held by loose title-memory window copies (`SHARED` RAM).
+fn loose_bytes(map: &BTreeMap<(u64, u64), Arc<Shadow>>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    map.values()
+        .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+        .map(|s| s.len)
+        .sum()
+}
+
+/// Non-blocking emergency trim of idle unreferenced loose windows (`SHARED` RAM)
+/// invoked by `Host::memory_safety_valve` and `Host::emergency_evict`.
+pub(crate) fn trim_loose_now() {
+    let Ok(mut map) = LOOSE.try_write() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    let keep = window_budget().map_or(256u64 << 20, |b| (b / 2).max(128 << 20));
+    let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
+        .iter()
+        .filter(|(_, s)| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), 500, 1)
+                && crate::host::references(&s.buffer) == 1
+        })
+        .map(|(&key, s)| (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len))
+        .collect();
+    if eligible.is_empty() {
+        return;
+    }
+    eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+    let entries: Vec<(u64, u64, usize)> = eligible.iter().map(|&(used, _, id, len)| (used, len, id)).collect();
+    let victims = window_victims(&entries, keep);
+    let gone: Vec<Arc<Shadow>> = victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect();
+    drop(map);
+    for shadow in gone {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        crate::host::retire(shadow);
+    }
+}
+
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
+    let shared_high = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .is_some_and(|[.., shared]| shared >= (1536u64 << 20));
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
     {
@@ -3135,19 +3196,21 @@ pub(crate) fn let_go_idle() {
         *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
         match *band {
             crate::host::RamBand::Calm => {
-                // On 16 GB hosts, proactively cap idle shared-RAM windows to
-                // `VICTORY_WINDOW_BUDGET_MB` before Commit climbs into paging.
-                if live_span_bytes() > bytes {
-                    idle_ms = idle_ms.min(4_000);
-                    keep = bytes;
+                // Enforce `VICTORY_WINDOW_BUDGET_MB` proactively against actual
+                // `LOOSE` shared-RAM window bytes (not VRAM-only `live_span_bytes`).
+                keep = bytes;
+                if shared_high {
+                    idle_ms = idle_ms.min(1_500);
+                } else {
+                    idle_ms = idle_ms.min(3_000);
                 }
             }
             crate::host::RamBand::Watch => {
-                idle_ms = idle_ms.min(5_000);
-                keep = bytes;
+                idle_ms = idle_ms.min(2_000);
+                keep = if shared_high { bytes / 2 } else { bytes };
             }
             crate::host::RamBand::High => {
-                idle_ms = idle_ms.min(1_500);
+                idle_ms = idle_ms.min(1_000);
                 keep = bytes / 2;
             }
         }
@@ -3157,6 +3220,9 @@ pub(crate) fn let_go_idle() {
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
+            return;
+        }
+        if keep != u64::MAX && loose_bytes(&map) <= keep && !shared_high {
             return;
         }
         let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map

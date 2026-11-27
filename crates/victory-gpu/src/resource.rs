@@ -1342,20 +1342,29 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     let tight_card = crate::host::host()
         .and_then(|h| h.video_memory())
         .is_some_and(|[budget, ..]| budget > 0 && budget <= (9u64 << 30));
-    let max = set.unwrap_or_else(|| {
+    let pct = video_memory_percent();
+    let is_large_world = desc.width >= 1024 || desc.height >= 1024;
+    let mut max = set.unwrap_or_else(|| {
         if tight_card {
-            match video_memory_percent() {
+            match pct {
                 0..82 => 512,
                 _ => 256,
             }
         } else {
-            match video_memory_percent() {
+            match pct {
                 0..92 => 1024,
                 92..97 => 512,
                 _ => 256,
             }
         }
     });
+    // Priority hierarchy: under VRAM pressure (>=82% on 8 GB cards or >=85%
+    // generally), downscale large Dynamic world textures (>=1024px) to 256px
+    // even when `VICTORY_TEXTURE_MAX` is set, keeping <=512px character/face
+    // detail maps crisp and `TX` in the 1.3-1.5 GiB band.
+    if is_large_world && ((tight_card && pct >= 82) || pct >= 85) {
+        max = max.min(256);
+    }
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
         if skip + 1 >= u32::from(desc.mip_levels) {
@@ -1899,7 +1908,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
                 if used >= hard_cap {
                     return false;
                 }
-                if shared >= (3584u64 << 20) && u128::from(used) * 100 >= u128::from(budget) * 82 {
+                if shared >= (1536u64 << 20) && u128::from(used) * 100 >= u128::from(budget) * 80 {
                     return false;
                 }
             } else if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
@@ -2376,12 +2385,14 @@ pub(crate) fn let_go_idle() {
 #[cfg(windows)]
 pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    const EMERGENCY_IDLE_MS: u64 = 1_000;
-    const EMERGENCY_IDLE_FRAMES: u64 = 2;
+    const EMERGENCY_IDLE_MS: u64 = 500;
+    const EMERGENCY_IDLE_FRAMES: u64 = 1;
     let Ok(all) = TEXTURES.try_lock() else {
         return 0;
     };
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // Priority order: evict large Dynamic world textures (>=1024px) before
+    // smaller character/face/eye maps, oldest first within each tier.
+    let mut by_age: Vec<(bool, u64, usize)> = Vec::new();
     for &at in all.iter() {
         // SAFETY: `all` holds the `TEXTURES` lock so resources cannot be freed.
         let r = unsafe { &*(at as *const Resource) };
@@ -2391,12 +2402,13 @@ pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
             && crate::host::long_ago(used, EMERGENCY_IDLE_MS, EMERGENCY_IDLE_FRAMES)
             && !crate::texture::host_wrote(at)
         {
-            by_age.push((used & 0xffff_ffff, at));
+            let large_dynamic = r.desc.width >= 1024 || r.desc.height >= 1024;
+            by_age.push((!large_dynamic, used & 0xffff_ffff, at));
         }
     }
     by_age.sort_unstable();
     let mut freed_bytes = 0u64;
-    for (_, at) in by_age {
+    for (_, _, at) in by_age {
         if freed_bytes >= target_bytes {
             break;
         }

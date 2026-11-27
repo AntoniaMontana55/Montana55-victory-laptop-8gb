@@ -91,7 +91,7 @@ fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     }
 }
 
-/// Dynamic mip LOD bias under VRAM pressure (>=82% -> +0.5, >=88% -> +1.0)
+/// Dynamic mip LOD bias under VRAM pressure (>=82% -> +1.0, >=85% -> +2.0)
 /// or explicit `VICTORY_MIP_BIAS` override so 8 GB cards relieve texture
 /// bandwidth without ever dropping a texture or model.
 fn pressure_mip_bias() -> f32 {
@@ -112,10 +112,10 @@ fn pressure_mip_bias() -> f32 {
             return bias;
         }
         let pct = crate::resource::vram_pressure_percent();
-        if pct >= 88 {
-            1.0
+        if pct >= 85 {
+            2.0
         } else if pct >= 82 {
-            0.5
+            1.0
         } else {
             0.0
         }
