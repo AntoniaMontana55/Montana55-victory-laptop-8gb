@@ -91,9 +91,13 @@ fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     }
 }
 
-/// Dynamic mip LOD bias under VRAM pressure (>=82% -> +1.0, >=85% -> +2.0)
-/// or explicit `VICTORY_MIP_BIAS` override so 8 GB cards relieve texture
-/// bandwidth without ever dropping a texture or model.
+/// Dynamic mip LOD bias under VRAM pressure or explicit `VICTORY_MIP_BIAS`
+/// override so 8 GB cards relieve texture bandwidth without ever dropping a
+/// texture or model. Below 91 % of the card's budget the bias is 0.0: every
+/// texture renders with its true sharpness. Only heavy pressure trims, and
+/// then at most +0.5 (91 %) or +1.0 (95 %) — distant terrain blurs slightly
+/// instead of character and vehicle surfaces going soft at the first sign of
+/// load.
 fn pressure_mip_bias() -> f32 {
     #[cfg(test)]
     {
@@ -112,10 +116,10 @@ fn pressure_mip_bias() -> f32 {
             return bias;
         }
         let pct = crate::resource::vram_pressure_percent();
-        if pct >= 85 {
-            2.0
-        } else if pct >= 82 {
+        if pct >= 95 {
             1.0
+        } else if pct >= 91 {
+            0.5
         } else {
             0.0
         }

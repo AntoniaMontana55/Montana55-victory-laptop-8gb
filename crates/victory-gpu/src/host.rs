@@ -6099,8 +6099,12 @@ impl Host {
         drop(heaps_synced);
         crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
+        // lists that may read them run: mirrored now, and any flips whose
+        // upload already finished are made now too, so no slot that has a
+        // resident texture goes on showing the neutral stand-in past this
+        // submission.
         crate::descriptor::make_waiting();
+        crate::descriptor::host::flip_now();
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -9431,6 +9435,15 @@ impl Host {
     /// process/system RAM, reclaiming idle command allocators, preludes,
     /// snapshot pools, loose shared-RAM windows, staging buffers and stale
     /// world textures BEFORE Windows hits `E_OUTOFMEMORY` (`0x8007000E`).
+    ///
+    /// Tiered, so resident textures are never touched before the cheaper
+    /// things are reclaimed: tier 1 (mild pressure: local VRAM past
+    /// 6.2 GiB, commit past 13.5 GiB or shared spill beginning) frees only
+    /// scratch — idle lists, preludes, snapshot pools, loose windows, staging
+    /// and pool blocks; resident textures keep their memory. Tier 2 (the old
+    /// line: near the OOM cap or shared spill deep) additionally evicts the
+    /// coldest LRU textures, which `evict_emergency` pins the last 2 s /
+    /// 90 frames of use against, so nothing on screen is thrown out.
     pub(crate) fn memory_safety_valve(&self) {
         const GIB: u64 = 1 << 30;
         static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -9439,13 +9452,27 @@ impl Host {
         if now < prev + 250 || LAST_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
             return;
         }
-        let ram_trip = ram_sample().is_some_and(|(_, private, free_phys, avail_commit, total_phys, _)| {
+        let ram = ram_sample();
+        let ram_trip = ram.is_some_and(|(_, private, free_phys, avail_commit, total_phys, _)| {
             let sys_used = total_phys.saturating_sub(free_phys);
             private >= (13 * GIB + (512 << 20))
                 || (total_phys <= 20 * GIB && sys_used >= (12 * GIB + (512 << 20)))
                 || avail_commit < (2 * GIB + (512 << 20))
         });
-        let vram_trip = self.video_memory().is_some_and(|[budget, used, _, shared]| {
+        // Tier 1 (mild RAM pressure: private RAM or system use rising but
+        // short of the hard trip, or commit headroom shrinking) reclaims
+        // only scratch.
+        let ram_light = ram.is_some_and(|(_, private, free_phys, avail_commit, total_phys, _)| {
+            let sys_used = total_phys.saturating_sub(free_phys);
+            (private >= 13 * GIB && private < (13 * GIB + (512 << 20)))
+                || (total_phys <= 20 * GIB
+                    && sys_used >= 12 * GIB
+                    && sys_used < (12 * GIB + (512 << 20)))
+                || (avail_commit < (2 * GIB + (512 << 20) + (512 << 20))
+                    && avail_commit >= (2 * GIB + (512 << 20)))
+        });
+        let video = self.video_memory();
+        let vram_trip = video.is_some_and(|[budget, used, _, shared]| {
             let cap = if budget > 0 && budget <= 9 * GIB {
                 budget.saturating_sub(512 << 20).min(6246 << 20)
             } else {
@@ -9453,8 +9480,28 @@ impl Host {
             };
             (budget > 0 && used >= cap) || shared >= 2 * GIB
         });
+        // Tier 1 (mild VRAM pressure on an 8 GB card: local past 5.9 GiB but
+        // below the OOM line, or shared spill starting) — scratch only.
+        let vram_light = video.is_some_and(|[budget, used, _, shared]| {
+            budget > 0
+                && budget <= 9 * GIB
+                && ((used >= 6042 << 20 && used < budget.saturating_sub(512 << 20).min(6246 << 20))
+                    || (shared >= (1u64 << 30) && shared < 2 * GIB))
+        });
         if ram_trip || vram_trip {
             self.emergency_evict();
+        } else if ram_light || vram_light {
+            // Tier 1: no resident texture loses its memory (no
+            // `evict_emergency`: its texture evictions are tier 2's).
+            trim_spare_chunks();
+            send::trim_spare();
+            self.trim_preludes(4);
+            crate::list::trim_idle(16);
+            crate::texture::trim_idle_now();
+            crate::shadow::trim_pool();
+            crate::shadow::trim_loose_now();
+            crate::shadow::trim_exact();
+            crate::pool::emergency_reclaim();
         }
     }
 

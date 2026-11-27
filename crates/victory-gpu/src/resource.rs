@@ -1323,6 +1323,13 @@ fn video_memory_percent() -> u64 {
 /// of the VRAM budget and 256 from 97 %, after Belobug / `VIctory-vitesse`).
 /// Keeps 8 GB VRAM cards from stalling thousands of textures while keeping
 /// full headroom for 3D models.
+///
+/// On a tight card (budget <= 9 GiB) the tiers only begin under real DXGI
+/// pressure: full resolution (`TX_MAX` band) to 90 % of the budget, 1024px
+/// from 90 %, 512px from 94 %. With `VICTORY_TEXTURE_MAX` set, that tier
+/// still rules. Large world textures (>= 1024px) step down first (512px from
+/// 91 %, 256px from 94 %); character/face/vehicle detail maps keep their
+/// native resolution unless the card is nearly full.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     // Character skin/face/decoration bakes need native resolution so baked
@@ -1347,8 +1354,9 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     let mut max = set.unwrap_or_else(|| {
         if tight_card {
             match pct {
-                0..82 => 512,
-                _ => 256,
+                0..90 => 2048,
+                90..94 => 1024,
+                _ => 512,
             }
         } else {
             match pct {
@@ -1358,12 +1366,14 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
             }
         }
     });
-    // Priority hierarchy: under VRAM pressure (>=82% on 8 GB cards or >=85%
-    // generally), downscale large Dynamic world textures (>=1024px) to 256px
-    // even when `VICTORY_TEXTURE_MAX` is set, keeping <=512px character/face
-    // detail maps crisp and `TX` in the 1.3-1.5 GiB band.
-    if is_large_world && ((tight_card && pct >= 82) || pct >= 85) {
+    // Priority hierarchy: only real pressure trims the far world (>= 1024px):
+    // 512px from 91 % on a tight card, 256px from 94 % (>= 85 % elsewhere).
+    // Character/face/vehicle near-field detail keeps <= 512px crisp and lets
+    // the texture pool use the headroom below the OOM line.
+    if is_large_world && ((tight_card && pct >= 94) || (!tight_card && pct >= 85)) {
         max = max.min(256);
+    } else if is_large_world && tight_card && pct >= 91 {
+        max = max.min(512);
     }
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
@@ -1376,13 +1386,19 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
 }
 
 /// Dynamic mip-drop bonus under VRAM pressure so 3D geometry (VB/IB/skeletons)
-/// always retains VRAM priority on 8 GB cards: >=82% drops 1 mip, >=88% drops 2.
+/// always retains VRAM priority: below 91 % of the budget nothing is dropped
+/// (full-resolution mips); 91 % drops 1 mip and 96 % drops 2 of the coldest
+/// large textures only. Bakes never drop a mip in any tier.
 #[cfg(windows)]
 fn pressure_drop_mips() -> u32 {
+    // Character skin/face/clothing/weapon detail bakes are never dropped.
+    if crate::texture::BAKING.get() {
+        return 0;
+    }
     let pct = video_memory_percent();
-    if pct >= 88 {
+    if pct >= 96 {
         2
-    } else if pct >= 82 {
+    } else if pct >= 91 {
         1
     } else {
         0
@@ -1864,14 +1880,60 @@ thread_local! {
     static LAST_TEXTURE_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// The pinned reading of `VICTORY_TEXTURE_BUDGET_MB` (tests may clear it,
+// `texture_budget_limit_reset`, and then re-read it while
+// `LIMIT_OVERRIDE` is set).
+#[cfg(windows)]
+thread_local! {
+    static TEXTURE_BUDGET: std::cell::Cell<Option<Option<u64>>> = const { std::cell::Cell::new(None) };
+}
+
+// Tests that change `VICTORY_TEXTURE_BUDGET_MB` set this so their thread
+// reads the variable again instead of the pinned answer.
+#[cfg(all(windows, test))]
+thread_local! {
+    static LIMIT_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Optional explicit cap on title-filled host textures (`VICTORY_TEXTURE_BUDGET_MB`).
+/// `VICTORY_TEXTURE_BUDGET_MB=dynamic` (or `dxgi`): on an 8 GB-class card the
+/// cap is not a flat number but the free side of the card's own budget — the
+/// room `room()` computes from DXGI anyway — so the pool can grow to what
+/// the card actually has (2.8-3.4 GiB of textures on a 6.6 GiB OS budget)
+/// and only a real budget crossing stops it. A number sets a flat ceiling,
+/// as before.
 #[cfg(windows)]
 fn texture_budget_limit() -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    #[cfg(test)]
+    if LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return texture_budget_limit_read();
+    }
+    TEXTURE_BUDGET.with(|cell| {
+        if let Some(set) = cell.get() {
+            return set;
+        }
+        let set = texture_budget_limit_read();
+        cell.set(Some(set));
+        set
     })
+}
+
+/// The reading of `VICTORY_TEXTURE_BUDGET_MB` the moment it is asked for.
+#[cfg(windows)]
+fn texture_budget_limit_read() -> Option<u64> {
+    let set = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+    let set = set.trim();
+    if set.eq_ignore_ascii_case("dynamic") || set.eq_ignore_ascii_case("dxgi") {
+        return None;
+    }
+    set.parse::<u64>().ok().map(|mb| mb << 20)
+}
+
+/// Test seam of [`texture_budget_limit`]: the pinned reading is forgotten,
+/// so the next one re-reads the environment variable.
+#[cfg(all(windows, test))]
+pub(crate) fn texture_budget_limit_reset() {
+    TEXTURE_BUDGET.with(|cell| cell.set(None));
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1893,27 +1955,35 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     {
         return false;
     }
+    // The card's own lines first — a floor of textures never crosses the
+    // OOM cap (8 GB cards: `budget - 512 MiB`, at most 6246 MiB) or a deep
+    // shared spill; the floor below only lifts the `room_percent` line.
+    if let Some([budget, used, _, shared]) = memory {
+        if budget > 0 && budget <= (9u64 << 30) {
+            let hard_cap = budget.saturating_sub(512 << 20).min(6246 << 20);
+            if used >= hard_cap {
+                return false;
+            }
+            if shared >= (1536u64 << 20) && u128::from(used) * 100 >= u128::from(budget) * 80 {
+                return false;
+            }
+        } else if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
+            return false;
+        }
+    }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if texture_budget_limit().is_none() && filled < floor {
         return true;
     }
     match memory {
-        // Strict zero-spill budget controller: on 8 GB cards (6.6 GiB OS budget),
-        // enforce a hard 6.1 GiB Local VRAM ceiling (`budget - 512 MiB`, capped
-        // at 6.1 GiB) and halt speculative growth when Shared spill >= 3.5 GiB
-        // so active models/RTs never thrash over PCIe.
-        Some([budget, used, _, shared]) => {
-            if budget > 0 && budget <= (9u64 << 30) {
-                let hard_cap = budget.saturating_sub(512 << 20).min(6246 << 20);
-                if used >= hard_cap {
-                    return false;
-                }
-                if shared >= (1536u64 << 20) && u128::from(used) * 100 >= u128::from(budget) * 80 {
-                    return false;
-                }
-            } else if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
-                return false;
-            }
+        // Dynamic texture budget on an 8 GB card (OS budget about 6.6 GiB):
+        // the hard OOM cap from the safety valve stays (`hard_cap`); below
+        // 6.4 GiB of local use the texture pool may grow past any flat
+        // figure — `VICTORY_TEXTURE_BUDGET_MB=dynamic` — and only real DXGI
+        // pressure (the `room_percent` line and tier-1 reclaim) slows it.
+        // LRU eviction of the coldest textures (never the pinned, on-screen
+        // ones) makes room when the pool is above its floor.
+        Some([budget, used, _, _]) => {
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
         }
@@ -2390,8 +2460,13 @@ pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
     let Ok(all) = TEXTURES.try_lock() else {
         return 0;
     };
-    // Priority order: evict large Dynamic world textures (>=1024px) before
-    // smaller character/face/eye maps, oldest first within each tier.
+    // Priority order: strict LRU by tiers. Cold large Dynamic world textures
+    // (>= 1024px, unused for the pin window) go first, then cold smaller
+    // ones; textures touched within the pin window (2 s / 90 frames — what
+    // the current frame and the ones just before it sampled) are never
+    // evicted, so nothing on screen thrashes back in as pop-in.
+    const PIN_MS: u64 = 2_000;
+    const PIN_FRAMES: u64 = 90;
     let mut by_age: Vec<(bool, u64, usize)> = Vec::new();
     for &at in all.iter() {
         // SAFETY: `all` holds the `TEXTURES` lock so resources cannot be freed.
@@ -2401,6 +2476,7 @@ pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
             && fills(&r.desc)
             && crate::host::long_ago(used, EMERGENCY_IDLE_MS, EMERGENCY_IDLE_FRAMES)
             && !crate::texture::host_wrote(at)
+            && crate::host::long_ago(used, PIN_MS, PIN_FRAMES)
         {
             let large_dynamic = r.desc.width >= 1024 || r.desc.height >= 1024;
             by_age.push((!large_dynamic, used & 0xffff_ffff, at));
@@ -2420,6 +2496,7 @@ pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
             };
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), EMERGENCY_IDLE_MS, EMERGENCY_IDLE_FRAMES)
+                    && crate::host::long_ago(r.host.used.load(Relaxed), PIN_MS, PIN_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -4934,5 +5011,154 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The dynamic texture budget: `VICTORY_TEXTURE_BUDGET_MB=dynamic` (or
+    /// `dxgi`) is no flat cap — the card's own budget, through `room`, rules
+    /// — and a plain number still caps.
+    #[cfg(windows)]
+    #[test]
+    fn the_texture_budget_can_follow_the_card_instead_of_a_flat_number() {
+        // The test process runs with no `VICTORY_TEXTURE_BUDGET_MB` set
+        // (scripts that set it are not part of the test run): `None`.
+        assert_eq!(texture_budget_limit(), None);
+        // A number caps, as before: 256 MiB.
+        // SAFETY: the tests of one binary run one at a time on this thread;
+        // no other thread reads the variable meanwhile.
+        unsafe { std::env::set_var("VICTORY_TEXTURE_BUDGET_MB", "256") };
+        LIMIT_OVERRIDE.with(|set| set.set(true));
+        let _ = texture_budget_limit_reset();
+        assert_eq!(texture_budget_limit(), Some(256 << 20));
+        unsafe { std::env::set_var("VICTORY_TEXTURE_BUDGET_MB", "dynamic") };
+        let _ = texture_budget_limit_reset();
+        assert_eq!(texture_budget_limit(), None);
+        unsafe { std::env::set_var("VICTORY_TEXTURE_BUDGET_MB", "DxGi") };
+        let _ = texture_budget_limit_reset();
+        assert_eq!(texture_budget_limit(), None);
+        unsafe { std::env::remove_var("VICTORY_TEXTURE_BUDGET_MB") };
+        let _ = texture_budget_limit_reset();
+        LIMIT_OVERRIDE.with(|set| set.set(false));
+    }
+
+    /// With the dynamic budget, a card two thirds full has room and a full
+    /// one has none: the flat-capping path (`filled >= limit`) never refuses
+    /// before the DXGI line does.
+    #[cfg(windows)]
+    #[test]
+    fn room_follows_the_card_not_a_flat_figure() {
+        // SAFETY: as above, one test at a time on this thread.
+        unsafe { std::env::remove_var("VICTORY_TEXTURE_BUDGET_MB") };
+        LIMIT_OVERRIDE.with(|set| set.set(false));
+        let _ = texture_budget_limit_reset();
+        // 8 GiB-class card (OS budget 6.6 GiB): two thirds used, no shared
+        // spill — room for more textures.
+        let budget = 6690 << 20;
+        let two_thirds = budget / 3 * 2;
+        assert!(room(Some([budget, two_thirds, 0, 0])));
+        // At the hard cap (budget - 512 MiB, at most 6246 MiB) it does not,
+        // whatever the texture budget would have allowed.
+        let cap = budget.saturating_sub(512 << 20).min(6246 << 20);
+        assert!(!room(Some([budget, cap, 0, 0])));
+        // Shared spill with local past 80 %: no room either.
+        assert!(!room(Some([budget, budget / 100 * 81, 0, 2 << 30])));
+    }
+
+    /// The safety valve's tiers: tier 1 reclaims only scratch (no resident
+    /// texture evicted), tier 2 evicts coldest first with the on-screen pin.
+    /// Here the pin and the order of `evict_emergency`: a texture used this
+    /// frame is never taken; an older one goes. (`long_ago` wants both a
+    /// frame count and a wall-clock age, so the frames are advanced by hand
+    /// and the age waited for, as a running title would give both.)
+    #[cfg(windows)]
+    #[test]
+    fn emergency_eviction_pins_recently_used_textures() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Two committed textures the title fills (no target flags): a small
+        // one and a large one, both idle in a moment.
+        let made = |width: u64| {
+            let desc = ResourceDesc {
+                dimension: 3,
+                width,
+                height: 256,
+                format: 98,
+                mip_levels: 1,
+                layout: 1,
+                ..buffer(0)
+            };
+            let mut out = std::ptr::null();
+            assert_eq!(
+                create_committed(
+                    std::ptr::null(),
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+        let fresh = made(64);
+        let stale = made(2048);
+        // Both get host copies (a use), with their last use noted. In a test
+        // process barely begun, `moment` itself is zero (no frames, no
+        // tenths), so the stale one is used again once a frame has begun:
+        // its last-use word must differ from zero to count as a use at all
+        // (`evict_emergency` reads `used != 0`).
+        assert!(host_copy(fresh).is_some());
+        assert!(host_copy(stale).is_some());
+        crate::frame::test_advance();
+        assert!(host_copy(stale).is_some());
+        // A title that runs gives the idle tests a frame count and an age:
+        // 2 s of frames (the pin window is 90) and 2.1 s of wall clock (the
+        // pin window is 2 s), so both count as idle now.
+        for _ in 0..120 {
+            crate::frame::test_advance();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        // The small one is used again this frame: the pin holds it.
+        let before_fresh = host_copy(fresh)
+            .map(|c| crate::host::references(&c.texture))
+            .expect("the fresh texture kept its host copy");
+        // An emergency eviction asked to free much more than either holds:
+        // only the stale, unpinned one may go.
+        let freed = evict_emergency(1 << 30);
+        assert!(freed > 0, "the stale texture was evicted");
+        let gone_fresh = host_copy(fresh).map_or(true, |c| {
+            crate::host::references(&c.texture) < before_fresh
+        });
+        assert!(!gone_fresh, "the texture used this frame stayed");
+        assert!(
+            resource(fresh).host.made.lock().unwrap().is_some(),
+            "the pinned texture kept its host copy"
+        );
+        assert!(
+            resource(stale).host.made.lock().unwrap().is_none(),
+            "the stale texture lost its host copy"
+        );
+        let _ = host;
+    }
+
+    /// Under 90 % of the card's budget the mip clamp and drop tiers never
+    /// fire: a texture keeps its full resolution (the skip counts are 0).
+    #[test]
+    fn full_resolution_below_the_pressure_line() {
+        // The tests run without `VICTORY_TEXTURE_MAX`/`VICTORY_MIP_BIAS`
+        // overrides (their `OnceLock`s were read as unset).
+        let large = texture(2048, 2048, 98, 11);
+        assert_eq!(over_cap(&large), 0, "no cap tier under the pressure line");
+        // `floor_level`'s pressure drop only counts from 91 % of the budget:
+        // without a card at that line nothing is floored (tests that run
+        // with no card at all read 0 %).
+        assert_eq!(pressure_drop_mips(), 0);
+        assert_eq!(floor_level(&large), 0, "no mip floor below the line");
+        let small_face = texture(512, 512, 98, 10);
+        assert_eq!(over_cap(&small_face), 0);
+        assert_eq!(floor_level(&small_face), 0);
     }
 }

@@ -40,14 +40,14 @@ if ($Profile -eq '1') {
     $profileName     = '1 - 720p MAKS FPS (1280x720 x0.70 | RELAY=2 | %100 Saf Shader)'
     $outputMode      = '1280x720'
     $renderScale     = '0.70'
-    $texBudgetMb     = '1536'
-    $texMax          = '512'
+    $texBudgetMb     = 'dynamic'
+    $texMax          = '0'
 } else {
-    $profileName     = '2 - 1080p FULL HD + TAM MODEL (1920x1080 x0.70 | RELAY=2 | 16MiB Pool)'
+    $profileName     = '2 - 1080p FULL HD + TAM DOKU (1920x1080 x0.70 | RELAY=2 | 16MiB Pool | Dinamik TX)'
     $outputMode      = '1920x1080'
     $renderScale     = '0.70'
-    $texBudgetMb     = '1536'
-    $texMax          = '512'
+    $texBudgetMb     = 'dynamic'
+    $texMax          = '0'
 }
 $relayMode       = '2'
 $lateWait        = '3'
@@ -94,7 +94,8 @@ $env:VICTORY_RENDER_SCALE             = $renderScale
 
 # === HIZ, TAM MODEL & DIRECTSTORAGE STREAMING (RX 7600 8 GB + 16 GB RAM) ===
 # RELAY=2 + LATE_WAIT=3 + ASYNC_SUBMIT=1 -> CPU/GPU paralel calisir (3-4 FPS seri kilidi acilir),
-# Belobug PreludeUpload + release_tables + 720p RT + TX 512px ile VRAM < 6.0 GiB (Shared tasma sifir!).
+# Belobug PreludeUpload + release_tables + 720p RT + Dinamik TX bütçesi ile VRAM < 6.4 GiB
+# (Shared tasma sifir, OOM 0x8007000E hatti 6.1 GiB'de korunur!).
 $env:VICTORY_RELAY                    = $relayMode
 $env:VICTORY_LATE_WAIT                = $lateWait
 $env:VICTORY_RELAY_COPY               = '1'
@@ -122,7 +123,9 @@ $env:VICTORY_DYNAMIC_SLOTS            = '524288'
 # BURY_LAG=8 + KEEP_FREED=0 + WINDOW_BUDGET=512MB/512KB + SNAPSHOT_POOL=64
 # -> COMMIT 19.2GB / SHARED 6.4GB / O 2.5GB sismesi ve 0x8007000E cokmesi kokten kapanir!
 # CARD_BUFFERS_MB=512 (MIN=4MB) -> CPU snapshot/compare yuku (SUB 318ms) GPU VRAM'e tasinir!
-# TEXTURE_NO_WAIT=0 + 16MiB havuz -> siyah yuz / bos karo ve TX 2.5GB kilitlenmesi biter!
+# TEXTURE_NO_WAIT=0 + 16MiB havuz + BUDGET=dynamic -> siyah yuz / bos karo ve TX kilitlenmesi biter:
+# doku havuzu 2.8-3.4 GiB'ye kadar gercek DXGI durumuna gore genisler, yalnizca 6.8 GiB+
+# gercek baskida katmanli LRU tahliyesi (aktif kare pin'iyle) devreye girer.
 $env:VICTORY_RESIDENCY                = '1'
 $env:VICTORY_RESIDENCY_LIMITED        = '1'
 $env:VICTORY_KEEP_FREED               = '0'
@@ -135,7 +138,7 @@ $env:VICTORY_TEXTURE_CATCHUP          = $texCatchup
 $env:VICTORY_TEXTURE_STAGE_MS         = $texStageMs
 $env:VICTORY_TEXTURE_MAX              = $texMax
 $env:VICTORY_TEXTURE_BUDGET_MB        = $texBudgetMb
-$env:VICTORY_TEXTURE_ROOM_PERCENT     = '85'
+$env:VICTORY_TEXTURE_ROOM_PERCENT     = '93'
 $env:VICTORY_PANEL                    = '1'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1024'
 $env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
@@ -165,7 +168,7 @@ Write-Host "         RX 7600 8GB | %100 Saf DXIL + Tam Model + PRELUDE_RING     
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil    : $profileName" -ForegroundColor Green
 Write-Host "  Shader    : %100 Saf DXIL (AMBIENT=0.85 | AIR=0.25 | RT_SKIP + CUTSCENE_FAST)" -ForegroundColor Yellow
-Write-Host "  Modeller  : Cilt Bake Korumasi + CATCHUP=1 + TX 512px + 128MB/48-Retry" -ForegroundColor Cyan
+Write-Host "  Modeller  : Cilt Bake Korumasi + CATCHUP=1 + TX Tam Cozunurluk (Dinamik DXGI)" -ForegroundColor Cyan
 Write-Host "  HUD       : Sol Ust FPS / Grafik / VRAM / CPU / RAM ACIK (F3 ile ac/kapa)" -ForegroundColor Magenta
 Write-Host "  RAM/VRAM  : Spotify/Discord/Brave/Chrome otomatik kapatildi + PRELUDE_RING" -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta

@@ -2556,16 +2556,26 @@ impl State {
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                // Priority tier: never leave small character face/eye/skin/detail
-                // textures (<= 512 KiB) black behind stale large world textures.
+                // Priority tier: never leave character face/eye/skin/clothing
+                // and other near-field detail textures visible this frame
+                // black or grey behind stale large world textures. Up to
+                // 512 KiB always; up to 8 MiB for the visible set (a texture
+                // picked by index is one a draw in this frame sampled), the
+                // cold far world waits behind them.
                 let critical_small = !has_its_texture
-                    && critical_admitted < 32
-                    && there.is_some_and(|bytes| bytes <= (512u64 << 10))
+                    && critical_admitted < 96
+                    && there.is_some_and(|bytes| {
+                        bytes <= (512u64 << 10)
+                            || (bytes <= (8u64 << 20) && !view_is_large_world(heap, index))
+                    })
                     && !crate::residency::critical_commit();
                 if critical_small {
                     critical_admitted += 1;
                     if critical_admitted == 1 {
                         let _ = crate::resource::evict_emergency(64 << 20);
+                    }
+                    if critical_admitted.is_multiple_of(32) {
+                        let _ = crate::resource::evict_emergency(128 << 20);
                     }
                 } else if !has_its_texture {
                     refused += 1;
@@ -4279,6 +4289,30 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
     let (param, _) = stage.user_data?;
     let word = stage.translated().host.user_data.iter().find(|u| u.root == RootType::Other(kind))?;
     Some((param, word.index))
+}
+
+/// Whether the texture the view of slot `index` of `heap` names is a large
+/// streamed world one (a placed 2D texture of 1024px or more on a side, or a
+/// shader-resource texture that big): the cold far environment, which the
+/// `critical_small` priority tier lets wait for room behind the smaller
+/// character/vehicle/near-field textures.
+fn view_is_large_world(heap: &crate::descriptor::Heap, index: u32) -> bool {
+    let Some(view) = heap.handle(index).and_then(crate::descriptor::view) else {
+        return false;
+    };
+    match view {
+        View::Placed(false, resource, desc) => {
+            let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let height = u64::from(resource[6]);
+            width >= 1024
+                || height >= 1024
+                || (u64::from(desc[4]) | u64::from(desc[5]) << 32) >= 1024
+                || u64::from(desc[6]) >= 1024
+        }
+        View::Shader(resource, _) => crate::resource::texture_kind(resource as This)
+            .is_some_and(|(width, height, _)| width >= 1024 || height >= 1024),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
