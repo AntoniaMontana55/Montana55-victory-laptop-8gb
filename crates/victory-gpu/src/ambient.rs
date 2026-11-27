@@ -222,6 +222,20 @@ RWStructuredBuffer<float4> points : register(u2);
 RWByteAddressBuffer stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
+// Sanitizes RDNA 3 indirect/SH probe values: strips NaN/Inf/negatives, drops
+// Belobug AMD magenta garbage probes, and tames runaway neon-green foliage
+// spikes so palm leaves at night render naturally instead of glowing green.
+float3 sanitize_probe(float3 c) {
+    if (any(isnan(c)) || any(isinf(c))) return float3(0.0, 0.0, 0.0);
+    c = max(c, 0.0);
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) return float3(0.0, 0.0, 0.0);
+    float rb_max = max(c.r, c.b);
+    if (c.g > 1.85 * rb_max + 0.04 && c.g > 0.12) {
+        c.g = min(c.g, 1.35 * max(rb_max, 0.05));
+    }
+    return c;
+}
+
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
@@ -240,8 +254,7 @@ void keep(uint3 at : SV_DispatchThreadID) {
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
-        float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        float3 c = sanitize_probe(radiance[p]);
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -393,12 +406,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
+    float hemi_open = lerp(0.48, 1.0, open);
+    float3 hemi_tint = lerp(float3(0.26, 0.25, 0.24), float3(0.36, 0.35, 0.33), saturate(n.y * 0.5 + 0.5));
     if (constant > 0.0) {
-        found = float3(1.0, 0.98, 0.94) * constant * open;
-        float3 was = unpack(light[p]);
-        // Belobug AMD magenta garbage probe filter + keep real sky/lamp light with a lit floor on faces.
-        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
-        float3 clean_was = any(isnan(was)) || any(isinf(was)) ? 0.0 : clamp(was, 0.0, 64.0);
+        found = float3(1.0, 0.98, 0.94) * constant * hemi_open;
+        float3 clean_was = clamp(sanitize_probe(unpack(light[p])), 0.0, 64.0);
         light[p] = pack(max(clean_was, found));
         return;
     }
@@ -424,15 +436,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    // Lit night/indoor floor + RDNA 3 NaN/Inf & Belobug AMD magenta probe
-    // sanitization so skin/SSS faces and dark interiors stay cleanly lit.
-    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
-    float3 night_floor = float3(0.28, 0.27, 0.26) * level * open;
+    // Hemisphere night/indoor ambient floor (never collapses to 0 in creases
+    // so characters like Lucia stay lit instead of black silhouettes) + full
+    // RDNA 3 NaN/Inf/magenta/neon-green probe sanitization.
+    found = sanitize_probe(found);
+    float3 night_floor = hemi_tint * level * hemi_open;
     found = max(found, night_floor);
-    float3 was = unpack(light[p]);
-    if (any(isnan(was)) || any(isinf(was))) was = 0.0;
-    was = max(was, 0.0);
-    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    float3 was = sanitize_probe(unpack(light[p]));
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.

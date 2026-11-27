@@ -1379,11 +1379,20 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.list.barriers(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
+            }
+            // On full single-subresource clears, hint `DiscardResource` before
+            // `ClearRenderTargetView` so AMD RDNA 3 uses hardware DCC fast-clear
+            // and never reads stale pages from VRAM/Shared RAM.
+            if rects.is_none() && record.desc().is_none() && discard_clears() {
+                let d = texture.GetDesc();
+                if d.MipLevels == 1 && d.DepthOrArraySize == 1 {
+                    list.list.DiscardResource(texture, None);
+                }
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
@@ -1431,12 +1440,29 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
+            if rects.is_none()
+                && record.depth_desc().is_none()
+                && (flags & 3) == 3
+                && !crate::resource::depth_and_unordered(record.resource)
+                && discard_clears()
+            {
+                let d = texture.GetDesc();
+                if d.MipLevels == 1 && d.DepthOrArraySize == 1 {
+                    list.list.DiscardResource(texture, None);
+                }
+            }
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+#[cfg(windows)]
+fn discard_clears() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISCARD_CLEARS").is_none_or(|v| v != "0"))
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses

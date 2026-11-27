@@ -646,6 +646,12 @@ fn bury_lag() -> u64 {
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
     bury_up_to(finished);
+    // Immediately reclaim finished idle `D3D12_HEAP_TYPE_UPLOAD` staging
+    // buffers when upload usage exceeds 256 MiB or host RAM is pressured so
+    // 16 GB systems stay below 12 GB RAM.
+    if crate::residency::pressured() || crate::texture::live_staging_bytes() > (256u64 << 20) {
+        crate::texture::trim_idle_now();
+    }
 }
 
 fn bury_up_to(finished: u64) {
@@ -10148,6 +10154,8 @@ impl Host {
                     .is_ok()
                         && allow_tearing != 0
                 });
+            const FRAME_LATENCY_WAITABLE: u32 = 0x40;
+            let base_flags = if tearing { 0x800 } else { 0 };
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -10159,15 +10167,27 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                Flags: if tearing { 0x800 } else { 0 },
+                Flags: base_flags | FRAME_LATENCY_WAITABLE,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, waitable) = match factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None) {
+                Ok(sc) => (sc.cast::<IDXGISwapChain3>()?, true),
+                Err(_) => {
+                    let fallback = DXGI_SWAP_CHAIN_DESC1 { Flags: base_flags, ..desc };
+                    (
+                        factory
+                            .CreateSwapChainForHwnd(&self.queue, hwnd, &fallback, None, None)?
+                            .cast::<IDXGISwapChain3>()?,
+                        false,
+                    )
+                }
+            };
+            if waitable {
+                let _ = swap_chain.SetMaximumFrameLatency(1);
+            }
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, tearing, "presenting to a window");
+            tracing::info!(width, height, format = format.0, tearing, latency_1 = waitable, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,

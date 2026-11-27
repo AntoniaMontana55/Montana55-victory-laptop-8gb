@@ -1293,6 +1293,13 @@ fn drop_mips() -> u32 {
 /// The share of the card's local VRAM budget in use, in percent (cached for
 /// a tenth of a second via [`crate::host::now_ms`]).
 #[cfg(windows)]
+pub(crate) fn vram_pressure_percent() -> u64 {
+    video_memory_percent()
+}
+
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
 fn video_memory_percent() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -1360,13 +1367,13 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
 }
 
 /// Dynamic mip-drop bonus under VRAM pressure so 3D geometry (VB/IB/skeletons)
-/// always retains VRAM priority on 8 GB cards: >=80% drops 1 mip, >=88% drops 2.
+/// always retains VRAM priority on 8 GB cards: >=82% drops 1 mip, >=88% drops 2.
 #[cfg(windows)]
 fn pressure_drop_mips() -> u32 {
     let pct = video_memory_percent();
     if pct >= 88 {
         2
-    } else if pct >= 80 {
+    } else if pct >= 82 {
         1
     } else {
         0
@@ -1882,18 +1889,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return true;
     }
     match memory {
-        // Strict zero-spill budget controller: never allow Local VRAM to cross
-        // 90% of the OS budget (e.g. 5.94 GiB of 6.6 GiB) or keep growing while
-        // WDDM is already spilling >= 3.5 GiB into Shared System RAM.
+        // Strict zero-spill budget controller: on 8 GB cards (6.6 GiB OS budget),
+        // enforce a hard 6.1 GiB Local VRAM ceiling (`budget - 512 MiB`, capped
+        // at 6.1 GiB) and halt speculative growth when Shared spill >= 3.5 GiB
+        // so active models/RTs never thrash over PCIe.
         Some([budget, used, _, shared]) => {
-            if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
-                return false;
-            }
-            if budget > 0
-                && budget <= (9u64 << 30)
-                && shared >= (3584u64 << 20)
-                && u128::from(used) * 100 >= u128::from(budget) * 82
-            {
+            if budget > 0 && budget <= (9u64 << 30) {
+                let hard_cap = budget.saturating_sub(512 << 20).min(6246 << 20);
+                if used >= hard_cap {
+                    return false;
+                }
+                if shared >= (3584u64 << 20) && u128::from(used) * 100 >= u128::from(budget) * 82 {
+                    return false;
+                }
+            } else if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90 {
                 return false;
             }
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()

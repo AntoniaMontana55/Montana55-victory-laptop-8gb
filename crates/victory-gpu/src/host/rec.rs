@@ -69,17 +69,35 @@ impl Rec {
             return;
         }
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut filtered: Vec<D3D12_RESOURCE_BARRIER> = Vec::with_capacity(barriers.len());
+        let mut last_global_uav = held.0.last().is_some_and(is_global_uav);
+        for b in barriers {
+            // Drop no-op transitions (`StateBefore == StateAfter`) and
+            // back-to-back global UAV(NULL) barriers to cut command-processor
+            // stall overhead across 4,500+ draws/frame.
+            if is_noop_transition(b) {
+                continue;
+            }
+            let global_uav = is_global_uav(b);
+            if global_uav && last_global_uav {
+                continue;
+            }
+            last_global_uav = global_uav;
+            // SAFETY: a plain copy of the description; borrowed pointers.
+            filtered.push(unsafe { std::ptr::read(b) });
+        }
+        if filtered.is_empty() {
+            return;
+        }
         // A resource whose state changes again: what is held goes first, so
         // that no call holds two changes of one resource.
-        if barriers.iter().filter_map(named).any(|r| held.0.iter().filter_map(named).any(|h| h == r)) {
+        if filtered.iter().filter_map(named).any(|r| held.0.iter().filter_map(named).any(|h| h == r)) {
             // SAFETY: as in `flush`.
             unsafe { self.list.ResourceBarrier(&held.0) };
             held.0.clear();
             STATS[1].fetch_add(1, Relaxed);
         }
-        // SAFETY: a plain copy of the descriptions; nothing is released
-        // through them (their pointers are borrowed, `ManuallyDrop`).
-        held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
+        held.0.extend(filtered);
         STATS[0].fetch_add(1, Relaxed);
         self.any.store(true, Relaxed);
     }
@@ -97,6 +115,22 @@ impl Rec {
         held.0.clear();
         STATS[1].fetch_add(1, Relaxed);
     }
+}
+
+fn is_noop_transition(b: &D3D12_RESOURCE_BARRIER) -> bool {
+    if b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+        return false;
+    }
+    // SAFETY: `Type == TRANSITION`, read-only inspection of state fields.
+    unsafe { b.Anonymous.Transition.StateBefore == b.Anonymous.Transition.StateAfter }
+}
+
+fn is_global_uav(b: &D3D12_RESOURCE_BARRIER) -> bool {
+    if b.Type != D3D12_RESOURCE_BARRIER_TYPE_UAV {
+        return false;
+    }
+    // SAFETY: `Type == UAV`, read-only inspection of nullable resource pointer.
+    unsafe { b.Anonymous.UAV.pResource.is_none() }
 }
 
 /// The resource a state change or aliasing names (its interface pointer).

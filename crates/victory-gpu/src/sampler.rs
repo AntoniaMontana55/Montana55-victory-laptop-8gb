@@ -62,7 +62,8 @@ impl Fields {
             MipLODBias: if self.bias.is_nan() {
                 0.0
             } else {
-                self.bias
+                let extra = if self.mip != 0 { pressure_mip_bias() } else { 0.0 };
+                (self.bias + extra)
                     .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
             },
             MaxAnisotropy: if aniso {
@@ -87,6 +88,37 @@ fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     match mode {
         1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
         _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+    }
+}
+
+/// Dynamic mip LOD bias under VRAM pressure (>=82% -> +0.5, >=88% -> +1.0)
+/// or explicit `VICTORY_MIP_BIAS` override so 8 GB cards relieve texture
+/// bandwidth without ever dropping a texture or model.
+fn pressure_mip_bias() -> f32 {
+    #[cfg(test)]
+    {
+        0.0
+    }
+    #[cfg(not(test))]
+    {
+        static SET: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let explicit = *SET.get_or_init(|| {
+            std::env::var("VICTORY_MIP_BIAS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+        });
+        if let Some(bias) = explicit {
+            return bias;
+        }
+        let pct = crate::resource::vram_pressure_percent();
+        if pct >= 88 {
+            1.0
+        } else if pct >= 82 {
+            0.5
+        } else {
+            0.0
+        }
     }
 }
 

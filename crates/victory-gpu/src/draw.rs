@@ -1021,8 +1021,12 @@ impl State {
     }
 
     /// The title's topology; console-only ones become host lists (see
-    /// [`crate::primitive`]).
+    /// [`crate::primitive`]). Deduplicates identical consecutive calls across
+    /// high-draw scenes (4,500+ draws/frame).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        if self.topology_set && self.topology == topology {
+            return;
+        }
         self.topology = topology;
         self.topology_set = true;
         let host = match topology {

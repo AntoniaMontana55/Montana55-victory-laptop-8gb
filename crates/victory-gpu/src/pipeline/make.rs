@@ -104,6 +104,9 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     // (`CS_ScreenProbes_TemporalResolve`) passes intact.
     if cutscene_fast {
         if named(shaders, b"CS_DepthOfField")
+            || named(shaders, b"DepthOfField_")
+            || named(shaders, b"CS_DOF")
+            || named(shaders, b"CS_Bokeh")
             || named(shaders, b"BokehDOF")
             || named(shaders, b"CircularDOF")
         {
@@ -111,14 +114,20 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         }
         if named(shaders, b"CS_VolumetricClouds")
             || named(shaders, b"VolumetricCloud")
+            || named(shaders, b"CloudShadow")
             || named(shaders, b"CloudRaymarch")
             || named(shaders, b"VolumetricFog_Raymarch")
             || named(shaders, b"VolumetricLighting_Raymarch")
         {
             return Some("heavy volumetric raymarch skipped for 30 FPS target");
         }
-        if named(shaders, b"CS_MotionBlur") || named(shaders, b"CS_LensFlare") {
-            return Some("optional post-process pass skipped for 30 FPS target");
+        if named(shaders, b"CS_MotionBlur")
+            || named(shaders, b"MotionBlur_")
+            || named(shaders, b"CS_LensFlare")
+            || named(shaders, b"CS_SSR_Trace")
+            || named(shaders, b"CS_ScreenSpaceReflections")
+        {
+            return Some("optional post-process/SSR pass skipped for 30 FPS target");
         }
     }
     None
