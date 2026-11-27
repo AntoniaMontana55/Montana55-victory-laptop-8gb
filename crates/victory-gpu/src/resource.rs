@@ -1290,26 +1290,63 @@ fn drop_mips() -> u32 {
     })
 }
 
-/// Dynamic mip-drop bonus under VRAM pressure so 3D geometry (VB/IB/skeletons)
-/// always retains VRAM priority on 8 GB cards: >=80% drops 1 mip, >=88% drops 2.
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
 #[cfg(windows)]
-fn pressure_drop_mips() -> u32 {
+fn video_memory_percent() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static LAST: AtomicU64 = AtomicU64::new(0);
     let tenth = crate::host::now_ms() / 100 + 1;
     let cached = LAST.load(Relaxed);
-    let pct = if cached >> 8 == tenth {
-        cached & 0xff
-    } else {
-        let p = crate::host::host()
-            .and_then(|h| h.video_memory())
-            .and_then(|[budget, used, ..]| {
-                (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
-            })
-            .unwrap_or(0);
-        LAST.store((tenth << 8) | p, Relaxed);
-        p
-    };
+    if cached >> 8 == tenth {
+        return cached & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| {
+            (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
+        })
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// How many of a streamed placed 2D texture's largest mips to skip so no side
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
+/// of the VRAM budget and 256 from 97 %, after Belobug / `VIctory-vitesse`).
+/// Keeps 8 GB VRAM cards from stalling thousands of textures while keeping
+/// full headroom for 3D models.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if set == Some(0) {
+        return 0;
+    }
+    let max = set.unwrap_or_else(|| match video_memory_percent() {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    });
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
+/// Dynamic mip-drop bonus under VRAM pressure so 3D geometry (VB/IB/skeletons)
+/// always retains VRAM priority on 8 GB cards: >=80% drops 1 mip, >=88% drops 2.
+#[cfg(windows)]
+fn pressure_drop_mips() -> u32 {
+    let pct = video_memory_percent();
     if pct >= 88 {
         2
     } else if pct >= 80 {
@@ -1336,11 +1373,12 @@ fn floor_level(desc: &ResourceDesc) -> u32 {
 }
 
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1683,15 +1721,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         } else {
             0
         };
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
-            // The store has its larger levels: made whole at once (unless mip_floor caps it).
-            if base > 0
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            // The store has its larger levels: made whole at once (unless capped).
+            if over_cap(&r.desc) == 0
+                && base > 0
                 && mip_floor == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
@@ -2830,6 +2867,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread

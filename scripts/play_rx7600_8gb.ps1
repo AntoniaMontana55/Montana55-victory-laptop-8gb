@@ -131,8 +131,10 @@ $env:VICTORY_HELD_LEVELS              = '1'
 $env:VICTORY_TEXTURE_NO_WAIT          = $texNoWait
 $env:VICTORY_TEXTURE_CATCHUP          = $texCatchup
 $env:VICTORY_TEXTURE_STAGE_MS         = $texStageMs
+$env:VICTORY_TEXTURE_MAX              = '1024'
 $env:VICTORY_TEXTURE_BUDGET_MB        = $texBudgetMb
 $env:VICTORY_TEXTURE_ROOM_PERCENT     = '92'
+$env:VICTORY_PANEL                    = '1'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1280'
 $env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
 $env:VICTORY_CARD_BUFFERS_MB          = '512'
@@ -161,7 +163,8 @@ Write-Host "====================================================================
 Write-Host "  Profil    : $profileName" -ForegroundColor Green
 Write-Host "  Shader    : %100 Saf DXIL (PORT_CBV=0 | BVH_MISS=0 | RT_RESOLVE=ON | Mor Filtre)" -ForegroundColor Yellow
 Write-Host "  Modeller  : Senkron Yukleme + CATCHUP=1 + NO_WAIT=0 + 2560MB + 128MB/48-Retry" -ForegroundColor Cyan
-Write-Host "  Koruma    : PRELUDE_RING (OOM sifir) + BURY_LAG=64 + CLAMP_WAITS=ON" -ForegroundColor Cyan
+Write-Host "  HUD       : Sol Ust FPS / Grafik / VRAM / CPU / RAM ACIK (F3 ile ac/kapa)" -ForegroundColor Magenta
+Write-Host "  Koruma    : PRELUDE_RING + Belobug Prelude Upload + Pool Batch + BURY_LAG=64" -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
 
 $hogs = Get-Process Discord,Spotify,brave,chrome -ErrorAction SilentlyContinue | Group-Object Name | ForEach-Object {
