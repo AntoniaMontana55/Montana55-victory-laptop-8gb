@@ -229,13 +229,16 @@ extern "system" fn create_queue(
 
 /// The title asks for 32 MiB and stops if this fails.
 ///
-/// `VICTORY_DSTORAGE_STAGING_MB=<n>`: at least that much (codec-d/cool_fox
-/// 641835a4, which makes it 256 MiB by default, so multi-MB RPF chunks do
-/// not starve the other cores); unset: what the title asks for.
+/// `VICTORY_DSTORAGE_STAGING_MB=<n>`: at least that much (default 128 MiB so
+/// multi-MB RPF character/vehicle/world mesh chunks never stall behind
+/// background texture batches; set `0` to keep the title's 32 MiB).
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let floor = *FLOOR_MB.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -847,7 +850,15 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, Read { request, note }) = lane.reads.front()?;
         let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        // High-priority lanes (class 0: realtime/high-priority mesh & world
+        // streaming) receive 2x burst staging headroom so urgent nearby models
+        // never stall behind background texture reads.
+        let staging_cap = if class == 0 {
+            self.staging.saturating_mul(2)
+        } else {
+            self.staging
+        };
+        if self.staged > 0 && self.staged + staging > staging_cap {
             self.starved = true;
             self.refused += 1;
             return None;
@@ -1659,11 +1670,14 @@ fn into_pages(
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
-    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all).
+    // later: wait and retry until mapping completes (`VICTORY_DSTORAGE_RETRIES`,
+    // default 48, ~5.5 s) so character/vehicle/world models are never silently dropped.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48)
     });
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0;
@@ -1719,11 +1733,18 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
     if super::xmem::pages_known(&pages, offset, len) {
         return pages;
     }
-    // Timed from here: what took long before was the lock on the page table
-    // (which the title's mapping calls hold), not the list.
+    // Timed from here: wait up to `VICTORY_DSTORAGE_PAGE_WAIT_MS` (default 5000 ms)
+    // so heavy streaming bursts finish mapping pages instead of stalling models.
+    static PAGE_WAIT_MS: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let wait_ms = *PAGE_WAIT_MS.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_PAGE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u128>().ok())
+            .unwrap_or(5000)
+    });
     let started = std::time::Instant::now();
     let mut known = false;
-    while !known && started.elapsed().as_millis() < 1500 {
+    while !known && started.elapsed().as_millis() < wait_ms {
         std::thread::sleep(std::time::Duration::from_millis(1));
         pages = read_list(list, offset, len);
         known = super::xmem::pages_known(&pages, offset, len);

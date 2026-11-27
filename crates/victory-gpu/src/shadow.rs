@@ -399,9 +399,17 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
-    {
+    let over_vram = |h: &crate::host::Host| {
+        h.video_memory()
+            .filter(|&[budget, used, ..]| used + size > budget / 100 * hundredths)
+    };
+    if over_vram(host).is_some() {
+        // Mesh/geometry priority over textures: evict oldest idle textures
+        // first to make room for vertex/index/skinning buffers in fast VRAM;
+        // if still full, callers fall back safely to system-RAM `shared_buffer`.
+        crate::resource::evict_emergency(size.max(64 << 20));
+    }
+    if let Some([budget, used, ..]) = over_vram(host) {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.

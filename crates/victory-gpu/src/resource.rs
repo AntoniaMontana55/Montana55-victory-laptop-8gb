@@ -1290,11 +1290,41 @@ fn drop_mips() -> u32 {
     })
 }
 
-/// Minimum host mip level enforced by [`drop_mips`] for large 2D filled
-/// textures (at least 512x512 with > 4 mips; never shrinks below 128px).
+/// Dynamic mip-drop bonus under VRAM pressure so 3D geometry (VB/IB/skeletons)
+/// always retains VRAM priority on 8 GB cards: >=80% drops 1 mip, >=88% drops 2.
+#[cfg(windows)]
+fn pressure_drop_mips() -> u32 {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let cached = LAST.load(Relaxed);
+    let pct = if cached >> 8 == tenth {
+        cached & 0xff
+    } else {
+        let p = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .and_then(|[budget, used, ..]| {
+                (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
+            })
+            .unwrap_or(0);
+        LAST.store((tenth << 8) | p, Relaxed);
+        p
+    };
+    if pct >= 88 {
+        2
+    } else if pct >= 80 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Minimum host mip level enforced by [`drop_mips`] and [`pressure_drop_mips`]
+/// for large 2D filled textures (at least 512x512 with > 4 mips; never shrinks
+/// below 128px) so VRAM tightens textures before ever dropping 3D models.
 #[cfg(windows)]
 fn floor_level(desc: &ResourceDesc) -> u32 {
-    let drop = drop_mips();
+    let drop = drop_mips().max(pressure_drop_mips());
     if drop == 0 || !fills(desc) || desc.width < 512 || desc.height < 512 || desc.mip_levels <= 4 {
         return 0;
     }
