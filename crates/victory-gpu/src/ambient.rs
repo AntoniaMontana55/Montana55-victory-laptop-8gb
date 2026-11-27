@@ -378,7 +378,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
         float3 was = unpack(light[p]);
-        // Keep real outdoor/sky/lamp lighting while guaranteeing a lit floor on faces & dark interiors.
+        // Belobug AMD magenta garbage probe filter + keep real sky/lamp light with a lit floor on faces.
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
         float3 clean_was = any(isnan(was)) || any(isinf(was)) ? 0.0 : clamp(was, 0.0, 64.0);
         light[p] = pack(max(clean_was, found));
         return;
@@ -405,7 +406,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Lit night floor + Belobug AMD magenta probe filter so night asphalt/faces stay clean.
+    float3 night_floor = float3(0.30, 0.29, 0.28) * level * open;
+    found = max(found, night_floor);
     float3 was = unpack(light[p]);
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.

@@ -397,13 +397,10 @@ struct Lower<'a> {
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it (2 s Windows TDR on RDNA 3). A lane that reaches
-/// the limit leaves the program as killed (a pixel discards).
+/// [`super::loop_limit`] says otherwise. Matches the pre-translated pure DXIL
+/// shader cache (2^20) so cached shaders and pipelines stay 100% valid.
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 16;
+pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
