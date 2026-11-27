@@ -52,14 +52,16 @@ if ($Profile -eq '1') {
 $relayMode       = '2'
 $lateWait        = '3'
 $asyncSubmit     = '1'
-$texNoWait       = '0'
+$texNoWait       = '1'
 $texCatchup      = '1'
 $texStageMs      = '250'
 $pipelineWaitMs  = '1500'
 
-# === %100 SAF STANDART DXIL SHADER (HICBIR SHADER BOZULMAZ, 25.694 ONBELLEKLE %100 UYUMLU) ===
-# PORT_CBV=0, PORT_DESCRIPTORS=0, PORT_CONSTANTS=0, BVH_MISS=0, RT_SKIP_RESOLVE=0,
-# RT_SKIP_EXTRA=0, CUTSCENE_FAST=0, FALLBACK_SHADER=0, RDNA_FLOAT unset, LOOP_LIMIT unset (2^20)
+# === %100 SAF STANDART DXIL SHADER (25.694 ONBELLEKLE %100 UYUMLU) ===
+# PORT_CBV=0, PORT_DESCRIPTORS=0, PORT_CONSTANTS=0, BVH_MISS=0, FALLBACK_SHADER=0
+# RT_SKIP_* + CUTSCENE_FAST yalnizca bos BVH RT / agir DoF & bulut raymarch compute
+# gecislerini atlar (DXIL shader cevirisini degistirmez, onbellek bozulmaz!).
+# AMBIENT=0.85 + AMBIENT_AIR=0.25 -> oda isigina uyumlu aydinlatma + ic mekan sis/isik patlamasi sifir!
 $env:VICTORY_PORT_CONSTANTS           = '0'
 $env:VICTORY_PORT_CBV                 = '0'
 $env:VICTORY_PORT_DESCRIPTORS         = '0'
@@ -69,15 +71,17 @@ $env:VICTORY_JOIN_BARRIERS            = '1'
 $env:VICTORY_UP_QUEUE                 = '0'
 $env:VICTORY_BVH_BUILDER              = '0'
 $env:VICTORY_BVH_MISS                 = '0'
-$env:VICTORY_RT_SKIP_RESOLVE          = '0'
+$env:VICTORY_RT_SKIP_RESOLVE          = '1'
 $env:VICTORY_RT_SKIP_ACTIVATE         = '1'
-$env:VICTORY_RT_SKIP_EXTRA            = '0'
-$env:VICTORY_CUTSCENE_FAST            = '0'
+$env:VICTORY_RT_SKIP_EXTRA            = '1'
+$env:VICTORY_CUTSCENE_FAST            = '1'
 $env:VICTORY_FALLBACK_SHADER          = '0'
-$env:VICTORY_AMBIENT                  = 'constant:0.35'
+$env:VICTORY_AMBIENT                  = '0.85'
 $env:VICTORY_AMBIENT_SHADE            = '0.55,0.5'
-$env:VICTORY_AMBIENT_AIR              = '1.0'
+$env:VICTORY_AMBIENT_AIR              = '0.25'
 $env:VICTORY_AMBIENT_SETTLE           = '150,2.5,1.0'
+$env:VICTORY_BAKE_EXACT               = '1'
+$env:VICTORY_BAKE_TEXTURES_MS         = '2000'
 
 # === ZAMANLAMA & CIKIS (720p RT = ~750 MB VRAM tasarrufu + 2x GPU hizi, sifir PSO hatasi) ===
 $env:VICTORY_NO_WATCHDOG              = '1'

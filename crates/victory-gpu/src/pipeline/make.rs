@@ -110,8 +110,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
             return Some("cutscene depth-of-field skipped for 30 FPS target");
         }
         if named(shaders, b"CS_VolumetricClouds")
+            || named(shaders, b"VolumetricCloud")
             || named(shaders, b"CloudRaymarch")
             || named(shaders, b"VolumetricFog_Raymarch")
+            || named(shaders, b"VolumetricLighting_Raymarch")
         {
             return Some("heavy volumetric raymarch skipped for 30 FPS target");
         }

@@ -310,23 +310,41 @@ void gather(uint3 at : SV_DispatchThreadID) {
 
 #ifdef AIR
 RWTexture3D<float3> scattered : register(u0);
-// No more than a multiple of the light around: of the room as the last
-// seconds showed it, and of the surface seen in this direction (towards a
-// window the air outside may be as bright as the sky is).
+// Bound what the air scatters so missing RT probes never blast indoor scenes
+// (prison cells / rooms) with blinding white or brown volumetric light shafts.
+// Works in both Estimate (`constant == 0`) and Constant (`constant > 0`) modes
+// and sanitizes any RDNA 3 NaN/Inf scattering values.
 [RootSignature(RS)]
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
     uint w, h, d;
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
-    float3 c = scattered[at];
+    float3 raw = scattered[at];
+    bool bad = any(isnan(raw)) || any(isinf(raw));
+    float3 c = bad ? float3(0.0, 0.0, 0.0) : max(raw, 0.0);
+    float far = float(at.z) / max(float(d), 1.0);
+    float base;
+    if (constant > 0.0) {
+        base = constant;
+    } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        float room_luma = max(dot(cells[CELLS].rgb, LUMA), 0.05);
+        float seen_luma = max(dot(seen_there, LUMA), 0.05);
+        base = lerp(room_luma, seen_luma, far);
+    }
+    // Tight near-camera indoor ceiling prevents harsh white light-shaft blowouts
+    // while keeping gentle atmospheric depth in the distance.
+    float hard_ceiling = lerp(0.16, 0.50, far) * max(air, 0.25);
+    float cap = min(air * base, hard_ceiling);
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (has > cap) {
+        scattered[at] = c * (cap / max(has, 1e-6));
+    } else if (bad) {
+        scattered[at] = c;
+    }
 }
 #endif
 
@@ -406,10 +424,14 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    // Lit night floor + Belobug AMD magenta probe filter so night asphalt/faces stay clean.
-    float3 night_floor = float3(0.30, 0.29, 0.28) * level * open;
+    // Lit night/indoor floor + RDNA 3 NaN/Inf & Belobug AMD magenta probe
+    // sanitization so skin/SSS faces and dark interiors stay cleanly lit.
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float3 night_floor = float3(0.28, 0.27, 0.26) * level * open;
     found = max(found, night_floor);
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was))) was = 0.0;
+    was = max(was, 0.0);
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
@@ -553,7 +575,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && air() == 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);

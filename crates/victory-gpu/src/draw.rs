@@ -2279,6 +2279,7 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        let baking = crate::texture::BAKING.get();
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -2286,7 +2287,16 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
+        // CRITICAL for character skin/face/arm `PS_BakeDecorations_*` bakes:
+        // a character's skin atlas is baked ONCE for the scene/run. If `!room`
+        // refuses its source textures here, faces bake pitch-black and arms
+        // bake flat-grey permanently. Evict stale world textures first if
+        // needed and always admit bake textures.
         let mut room = crate::resource::room(memory);
+        if baking && !room {
+            let _ = crate::resource::evict_emergency(256 << 20);
+            room = true;
+        }
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2317,7 +2327,6 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let baking = crate::texture::BAKING.get();
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
@@ -2735,7 +2744,7 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if !baking && room && since_asked >= 32 << 20 {
                 since_asked = 0;
                 room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
             }

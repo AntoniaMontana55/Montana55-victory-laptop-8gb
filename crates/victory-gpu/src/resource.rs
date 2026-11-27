@@ -1318,6 +1318,11 @@ fn video_memory_percent() -> u64 {
 /// full headroom for 3D models.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
+    // Character skin/face/decoration bakes need native resolution so baked
+    // faces and arms stay crisp and properly aligned.
+    if crate::texture::BAKING.get() {
+        return 0;
+    }
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let set = *SET.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_MAX")

@@ -62,6 +62,10 @@ pub(crate) struct Staging {
     /// Made by the pass over textures picked by index, for one upload
     /// ([`once`]): read when the list is submitted, and never looked at again.
     once: std::sync::atomic::AtomicBool,
+    /// Staged for a character skin/decoration bake (`PS_BakeDecorations_*`):
+    /// always waits synchronously for title memory remaps even when
+    /// `VICTORY_TEXTURE_NO_WAIT=1`, preventing black faces / grey arms.
+    bake: std::sync::atomic::AtomicBool,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     /// The title texture's shape, for `crate::texstore`.
@@ -799,6 +803,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
     }
+    if BAKING.get() {
+        staging.bake.store(true, Relaxed);
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
@@ -1343,10 +1350,11 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait() && !self.bake.load(std::sync::atomic::Ordering::Relaxed) {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
+            // all (`no_wait`). Character skin bakes (`self.bake`) always wait
+            // so faces and arms never bake black or flat grey.
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };
@@ -1967,6 +1975,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         serial: copy.serial,
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
+        bake: std::sync::atomic::AtomicBool::new(BAKING.get()),
         bytes: total,
         shape: desc.shape(),
         memory,
