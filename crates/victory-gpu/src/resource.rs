@@ -1276,6 +1276,35 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// Optional mip drop for large streaming BC7/BC3 textures on 8 GB VRAM cards
+/// (`VICTORY_TEXTURE_DROP_MIPS=<0..=3>`, default 0): keeps textures compact
+/// while preserving full VRAM headroom for 3D geometry (VB/IB/skinning buffers).
+#[cfg(windows)]
+fn drop_mips() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(0, |n| n.min(3))
+    })
+}
+
+/// Minimum host mip level enforced by [`drop_mips`] for large 2D filled
+/// textures (at least 512x512 with > 4 mips; never shrinks below 128px).
+#[cfg(windows)]
+fn floor_level(desc: &ResourceDesc) -> u32 {
+    let drop = drop_mips();
+    if drop == 0 || !fills(desc) || desc.width < 512 || desc.height < 512 || desc.mip_levels <= 4 {
+        return 0;
+    }
+    let mut base = base_level(desc, drop);
+    while base > 0 && ((desc.width >> base) < 128 || (u64::from(desc.height) >> base) < 128) {
+        base -= 1;
+    }
+    base
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
 /// host can have as a texture's level 0 ([`read_from`]; block-compressed
 /// formats in whole blocks).
@@ -1392,7 +1421,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    let target = base_level(&r.desc, first).max(floor_level(&r.desc));
+    if host.base == 0 || host.base <= target {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1614,9 +1644,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // pick by index among them, plus optional `VICTORY_TEXTURE_DROP_MIPS`
+        // cap so large streaming textures leave VRAM headroom for 3D meshes.
         let mut base = 0;
         let mut prefill = None;
+        let mip_floor = if shape_fits && r.host.placed.load(Relaxed) && tiled.is_none() && alias_of(this).is_none() {
+            floor_level(&r.desc)
+        } else {
+            0
+        };
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
@@ -1624,8 +1660,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
-            // The store has its larger levels: made whole at once.
+            // The store has its larger levels: made whole at once (unless mip_floor caps it).
             if base > 0
+                && mip_floor == 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
             {
@@ -1633,12 +1670,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 prefill = Some(found);
             }
         }
+        if mip_floor > base {
+            base = mip_floor;
+        }
+        LAST_TEXTURE_OOM.set(false);
         let texture = match texture {
             Some(texture) => Some(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
+            // Do not permanently blacklist a texture/render-target on transient
+            // E_OUTOFMEMORY: allow retry once eviction frees VRAM.
+            if !LAST_TEXTURE_OOM.replace(false) {
+                r.host.refused.store(true, Relaxed);
+            }
             return None;
         };
         let twin = twin_texture(&r.desc, &texture);
@@ -1714,37 +1759,49 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+#[cfg(windows)]
+thread_local! {
+    static LAST_TEXTURE_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Optional explicit cap on title-filled host textures (`VICTORY_TEXTURE_BUDGET_MB`).
+#[cfg(windows)]
+fn texture_budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
-/// which ended runs 20 and 24.
+/// sets an additional ceiling on those copies' bytes without bypassing the
+/// card's reserved headroom for 3D geometry buffers and render targets).
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
+    if let Some(limit) = texture_budget_limit()
+        && filled >= limit
+    {
+        return false;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
+    if texture_budget_limit().is_none() && filled < floor {
         return true;
     }
     match memory {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+        // used — so 3D geometry buffers and targets always have priority.
         Some([budget, used, ..]) => {
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
@@ -2084,7 +2141,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
+    let (mut idle_ms, mut most) = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2093,6 +2150,17 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // Enforce explicit `VICTORY_TEXTURE_BUDGET_MB` proactively before VRAM
+    // reaches OOM: when filled textures cross 90% of the budget, evict oldest
+    // idle copies down to 80% of the budget.
+    if let Some(limit) = texture_budget_limit() {
+        let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+        if filled > limit / 10 * 9 {
+            let target = filled.saturating_sub(limit / 10 * 8);
+            idle_ms = idle_ms.min(2_000);
+            most = if most == u64::MAX { target } else { most.max(target) };
+        }
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2184,6 +2252,66 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Non-blocking emergency eviction of oldest idle filled textures on
+/// `E_OUTOFMEMORY`: uses `try_lock` so it can never deadlock even if invoked
+/// from an allocation path holding a single resource lock.
+#[cfg(windows)]
+pub(crate) fn evict_emergency(target_bytes: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    const EMERGENCY_IDLE_MS: u64 = 1_000;
+    const EMERGENCY_IDLE_FRAMES: u64 = 2;
+    let Ok(all) = TEXTURES.try_lock() else {
+        return 0;
+    };
+    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    for &at in all.iter() {
+        // SAFETY: `all` holds the `TEXTURES` lock so resources cannot be freed.
+        let r = unsafe { &*(at as *const Resource) };
+        let used = r.host.used.load(Relaxed);
+        if used != 0
+            && fills(&r.desc)
+            && crate::host::long_ago(used, EMERGENCY_IDLE_MS, EMERGENCY_IDLE_FRAMES)
+            && !crate::texture::host_wrote(at)
+        {
+            by_age.push((used & 0xffff_ffff, at));
+        }
+    }
+    by_age.sort_unstable();
+    let mut freed_bytes = 0u64;
+    for (_, at) in by_age {
+        if freed_bytes >= target_bytes {
+            break;
+        }
+        // SAFETY: `all` still holds the `TEXTURES` lock.
+        let r = unsafe { &*(at as *const Resource) };
+        let gone = {
+            let Ok(mut made) = r.host.made.try_lock() else {
+                continue;
+            };
+            let idle = made.as_ref().is_some_and(|(host, _)| {
+                crate::host::long_ago(r.host.used.load(Relaxed), EMERGENCY_IDLE_MS, EMERGENCY_IDLE_FRAMES)
+                    && std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if idle {
+                crate::texture::unstage(at as This);
+                r.host.wanted.store(u32::MAX, Relaxed);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            freed_bytes += host.bytes;
+            crate::host::retire(host);
+        }
+    }
+    freed_bytes
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2553,7 +2681,10 @@ fn host_texture_as(
         return Some(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    let state_flags = D3D12_RESOURCE_STATES(
+        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+    );
+    let mut made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2561,9 +2692,7 @@ fn host_texture_as(
         unsafe {
             host.device.CreateReservedResource(
                 (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
+                state_flags,
                 None,
                 &mut texture,
             )
@@ -2576,17 +2705,50 @@ fn host_texture_as(
                 &heap,
                 crate::host::not_resident(),
                 (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
+                state_flags,
                 // The same layout: format, then color or depth and stencil.
                 clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
                 &mut texture,
             )
         }
     };
+    // On E_OUTOFMEMORY (8 GB VRAM pressure), evict idle textures/staging/pools
+    // and retry once before giving up.
+    if let Err(e) = &made
+        && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+    {
+        crate::residency::allocation_error(e);
+        host.emergency_evict();
+        texture = None;
+        made = if reserved {
+            // SAFETY: same validated description and out pointer.
+            unsafe {
+                host.device.CreateReservedResource(
+                    (&raw const d).cast(),
+                    state_flags,
+                    None,
+                    &mut texture,
+                )
+            }
+        } else {
+            // SAFETY: same validated description and out pointer.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    (&raw const d).cast(),
+                    state_flags,
+                    clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                    &mut texture,
+                )
+            }
+        };
+    }
     if let Err(e) = &made {
         crate::residency::allocation_error(e);
+        if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+            LAST_TEXTURE_OOM.set(true);
+        }
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -2594,8 +2756,20 @@ fn host_texture_as(
         && let Some(t) = &texture
         && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+            crate::residency::allocation_error(&e);
+            host.emergency_evict();
+            if let Err(e2) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device)) {
+                if e2.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                    LAST_TEXTURE_OOM.set(true);
+                }
+                tracing::warn!(error = %e2, desc = ?d, "a host texture is not resident");
+                texture = None;
+            }
+        } else {
+            tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+            texture = None;
+        }
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {

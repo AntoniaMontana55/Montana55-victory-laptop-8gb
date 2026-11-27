@@ -54,23 +54,29 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    let (resolve, activate, extra) = *SKIP.get_or_init(|| {
+    static SKIP: OnceLock<(bool, bool, bool, bool)> = OnceLock::new();
+    let (resolve, activate, extra, cutscene_fast) = *SKIP.get_or_init(|| {
         let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let cutscene_fast = on("VICTORY_CUTSCENE_FAST");
         if on("VICTORY_BVH_BUILDER") {
-            return (false, false, false);
+            if cutscene_fast {
+                tracing::info!("cutscene fast mode: skipping heavy optional DoF/volumetric/motion-blur compute passes (VICTORY_CUTSCENE_FAST=1)");
+            }
+            return (false, false, false, cutscene_fast);
         }
         let skip = (
             on("VICTORY_RT_SKIP_RESOLVE"),
             on("VICTORY_RT_SKIP_ACTIVATE"),
-            on("VICTORY_RT_SKIP_EXTRA"),
+            on("VICTORY_RT_SKIP_EXTRA") || cutscene_fast,
+            cutscene_fast,
         );
-        if skip.0 || skip.1 || skip.2 {
+        if skip.0 || skip.1 || skip.2 || skip.3 {
             tracing::info!(
                 resolve = skip.0,
                 activate = skip.1,
                 extra = skip.2,
-                "ray-tracing pipelines left out (no structures built)"
+                cutscene_fast = skip.3,
+                "optional heavy compute pipelines left out"
             );
         }
         skip
@@ -90,6 +96,27 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         }
         if named(shaders, b"CS_RTShadowTrace") {
             return Some("traces RT shadows without structures");
+        }
+    }
+    // Cutscene 30 FPS profile (`VICTORY_CUTSCENE_FAST=1`): skip expensive
+    // optional DoF, volumetric cloud/fog raymarch and motion-blur compute
+    // passes while preserving all geometry, lighting and `VICTORY_AMBIENT`
+    // (`CS_ScreenProbes_TemporalResolve`) passes intact.
+    if cutscene_fast {
+        if named(shaders, b"CS_DepthOfField")
+            || named(shaders, b"BokehDOF")
+            || named(shaders, b"CircularDOF")
+        {
+            return Some("cutscene depth-of-field skipped for 30 FPS target");
+        }
+        if named(shaders, b"CS_VolumetricClouds")
+            || named(shaders, b"CloudRaymarch")
+            || named(shaders, b"VolumetricFog_Raymarch")
+        {
+            return Some("heavy volumetric raymarch skipped for 30 FPS target");
+        }
+        if named(shaders, b"CS_MotionBlur") || named(shaders, b"CS_LensFlare") {
+            return Some("optional post-process pass skipped for 30 FPS target");
         }
     }
     None

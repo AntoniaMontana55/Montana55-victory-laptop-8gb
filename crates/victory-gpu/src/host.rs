@@ -169,10 +169,22 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
+    const TIGHT_SHORT_MS: u64 = 1_000;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
+    // On 8 GB cards (WDDM budget <= 9 GiB), start reclaiming earlier so sudden
+    // cutscene RT/UAV/geometry bursts never hit E_OUTOFMEMORY (0x8007000E).
+    if budget <= (9u64 << 30) {
+        if used < share(80) {
+            return (KEPT_MS, u64::MAX);
+        } else if used < share(90) {
+            return (IDLE_MS, used - share(72));
+        } else {
+            return (TIGHT_SHORT_MS, used - share(72));
+        }
+    }
     if used < share(88) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
@@ -619,6 +631,10 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
+    bury_up_to(finished);
+}
+
+fn bury_up_to(finished: u64) {
     for part in &RETIRED {
         let done: Vec<(u64, Retired)> = {
             let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
@@ -630,6 +646,33 @@ fn bury(finished: u64) {
         };
         drop(done);
     }
+}
+
+/// How often (in ms) `late_free_present` forces a sync settle for the idle
+/// sweep (`VICTORY_SWEEP_SETTLE_MS`, default 1500; higher reduces cutscene
+/// stall spikes while pressure still triggers an immediate sweep).
+fn sweep_settle_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_SWEEP_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(1500, |ms| ms.clamp(500, 10_000))
+    })
+}
+
+/// Maximum command lists per `ExecuteCommandLists` call in `late` mode before
+/// splitting with an intermediate `queue.Signal` to prevent 2-second Windows
+/// TDR timeouts (`0x887A0007`) during heavy scene/cutscene transitions
+/// (`VICTORY_SUBMIT_CHUNK`, default 8; 0 disables chunking).
+fn submit_chunk() -> usize {
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("VICTORY_SUBMIT_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+    })
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -5724,7 +5767,11 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present()
+            && (now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_settle_ms()
+                || ((crate::residency::pressured() || crate::residency::upload_refused())
+                    && now_ms() > SWEPT.load(Ordering::Relaxed) + 1000))
+        {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -5918,14 +5965,40 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
+            let chunk = submit_chunk();
+            // SAFETY: closed lists; the fence is ours. Splitting large batches
+            // with intermediate fence signals breaks WDDM DMA packets so heavy
+            // scene/cutscene transitions do not exceed Windows' 2-second TDR.
             let signalled = unsafe {
                 let mut from = 0;
+                let mut err = None;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    if chunk > 0 && to.saturating_sub(from) > chunk {
+                        let mut at = from;
+                        while at < to {
+                            let end = (at + chunk).min(to);
+                            self.queue.ExecuteCommandLists(&lists[at..end]);
+                            if end < lists.len() {
+                                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                                    err = Some(e);
+                                    break;
+                                }
+                                *submitted += 1;
+                            }
+                            at = end;
+                        }
+                        if err.is_some() {
+                            break;
+                        }
+                    } else {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                    }
                     from = to;
                 }
-                self.queue.Signal(&self.fence, *submitted)
+                match err {
+                    Some(e) => Err(e),
+                    None => self.queue.Signal(&self.fence, *submitted),
+                }
             };
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
@@ -9022,7 +9095,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
+        let mut made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -9038,6 +9111,31 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            buffer = None;
+            data = std::ptr::null_mut();
+            // SAFETY: retry after reclaiming idle scratch/staging/texture memory.
+            made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        resident(&self.device, b)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+        }
         #[cfg(feature = "diagnostics")]
         if made.is_ok()
             && let Some(b) = &buffer
@@ -9052,6 +9150,28 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// Emergency non-blocking VRAM/RAM reclamation invoked on `E_OUTOFMEMORY`
+    /// (`0x8007000E`) before retrying critical buffer/UAV/texture allocations.
+    pub(crate) fn emergency_evict(&self) {
+        static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if EVICTING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        trim_spare_chunks();
+        send::trim_spare();
+        crate::texture::trim_idle_now();
+        crate::shadow::trim_exact();
+        crate::pool::emergency_reclaim();
+        let evicted = crate::resource::evict_emergency(256 << 20);
+        // Drop completed retired GPU resources keeping a minimal 4-submission
+        // safety margin for in-flight recorded lists.
+        bury_up_to(FINISHED.load(Ordering::Acquire).saturating_sub(4));
+        if evicted > 0 {
+            trail(|| format!("emergency_evict: reclaimed {} KiB of idle textures after E_OUTOFMEMORY", evicted >> 10));
+        }
+        EVICTING.store(false, Ordering::Release);
     }
 }
 
@@ -9074,6 +9194,7 @@ struct Presenter {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    tearing: bool,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -9568,7 +9689,13 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(if p.tearing { 0x800 } else { 0 }),
+                    )
             };
             match resized {
                 Ok(()) => {
@@ -9784,7 +9911,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let mut status = p.swap_chain.Present(0, DXGI_PRESENT(if p.tearing { 0x200 } else { 0 }));
+            if p.tearing && status == windows::core::HRESULT(0x887A_0001_u32 as i32) {
+                p.tearing = false;
+                status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
@@ -9814,6 +9945,18 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let mut allow_tearing = 0u32;
+            let tearing = factory
+                .cast::<IDXGIFactory5>()
+                .is_ok_and(|f5| {
+                    f5.CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        (&raw mut allow_tearing).cast(),
+                        size_of::<u32>() as u32,
+                    )
+                    .is_ok()
+                        && allow_tearing != 0
+                });
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9825,6 +9968,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if tearing { 0x800 } else { 0 },
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9832,13 +9976,14 @@ impl Host {
                 .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(width, height, format = format.0, tearing, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                tearing,
                 copy,
                 ahead: Vec::new(),
                 hwnd,
@@ -10011,7 +10156,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
+        let mut made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -10028,6 +10173,33 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            buffer = None;
+            data = std::ptr::null_mut();
+            // SAFETY: retry after reclaiming idle memory so geometry/skinning
+            // buffers do not fail silently on transient OOM.
+            made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+        }
         #[cfg(feature = "diagnostics")]
         if made.is_ok()
             && let Some(b) = &buffer
@@ -10037,6 +10209,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
@@ -10100,7 +10273,7 @@ impl Host {
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
+        let mut made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
@@ -10117,9 +10290,36 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            buffer = None;
+            data = std::ptr::null_mut();
+            // SAFETY: retry after emergency VRAM reclamation.
+            made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
             }
@@ -10163,31 +10363,40 @@ impl Host {
             )
         };
         // A deferred allocation can be refused for want of reserved address
-        // space. The same bytes in an ordinary committed allocation leave the
-        // view's size intact, so retry that once on E_OUTOFMEMORY.
+        // space or 8 GB VRAM exhaustion (`0x8007000E`). Reclaim idle VRAM
+        // (textures, staging, scratch, pools, completed retirements) and retry
+        // once with a plain committed allocation before failing.
         if let Err(e) = &made
             && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
         {
             crate::residency::allocation_error(e);
-            if flags != D3D12_HEAP_FLAG_NONE {
-                buffer = None;
-                made = unsafe {
-                    self.device.CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut buffer,
-                    )
-                };
-            }
+            self.emergency_evict();
+            buffer = None;
+            // SAFETY: retry after reclaiming idle VRAM.
+            made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+            };
         }
         #[cfg(feature = "diagnostics")]
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let mut made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+            && let Some(b) = &buffer
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            made = resident(&self.device, b).and_then(|()| mapped(&self.device));
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {

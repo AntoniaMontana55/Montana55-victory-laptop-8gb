@@ -153,6 +153,24 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Sleeps for `duration` with sub-millisecond accuracy so 33.333 ms (30 FPS)
+/// pacing does not overshoot due to OS scheduler jitter.
+fn precise_sleep(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + duration;
+    const GUARD: Duration = Duration::from_millis(2);
+    if let Some(coarse) = duration.checked_sub(GUARD)
+        && !coarse.is_zero()
+    {
+        std::thread::sleep(coarse);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -184,12 +202,10 @@ pub(crate) extern "system" fn wait(
     }
     let _called = crate::timeline::span("the title's frame wait");
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        precise_sleep(limit);
         TIMEOUT
     } else {
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
+        precise_sleep(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };

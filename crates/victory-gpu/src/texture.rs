@@ -543,6 +543,33 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Emergency non-blocking trim of idle texture staging buffers on `E_OUTOFMEMORY`.
+pub(crate) fn trim_idle_now() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Ok(mut map) = STAGING.try_lock() else {
+        return;
+    };
+    let Some(map) = map.as_mut() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    map.retain(|_, s| {
+        let keep = Arc::strong_count(s) > 1
+            || !crate::host::long_ago(s.used.load(Relaxed), 500, 1);
+        if !keep {
+            LET_GO[0].fetch_add(1, Relaxed);
+            LET_GO[1].fetch_add(s.bytes, Relaxed);
+            freed.push(Arc::clone(s));
+        }
+        keep
+    });
+    drop(map);
+    drop(freed);
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);

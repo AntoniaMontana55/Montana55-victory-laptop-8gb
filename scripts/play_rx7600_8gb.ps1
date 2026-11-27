@@ -1,4 +1,4 @@
-﻿# clawz GTA VI — Kararli & Temiz Shader Baslaticisi (RX 7600 8 GB)
+# clawz GTA VI — Kararli & Temiz Shader Baslaticisi (RX 7600 8 GB)
 param(
     [ValidateSet('', 'ultralow', 'low', 'medium', 'high', 'ultra')]
     [string]$Preset = '',
@@ -26,12 +26,12 @@ if (-not (Test-Path $gameExe)) {
 $turboMode = [bool]$Turbo
 $rtEnabled = [bool]$EnableRT
 $useFsr    = [bool]$FsrFixed720p
-$Host.UI.RawUI.WindowTitle = 'clawz - GTA VI (Temiz Shader + Kararli Mod Menusu)'
+$Host.UI.RawUI.WindowTitle = 'clawz - GTA VI (Temiz Shader + 30 FPS Ara Sahne + Kararli Mod)'
 
 if (-not $Preset) {
     while (-not $Preset) {
         Clear-Host
-        $modeTxt = if ($turboMode) { "ULTRA-SAFE SENKRON (RELAY=2 korunur, yavas test modu)" } else { "HIZLI & TEMIZ SHADER (ONERILEN - RELAY=2 + Port #6/#7, cokmesiz)" }
+        $modeTxt = if ($turboMode) { "ULTRA-SAFE SENKRON (RELAY=2 korunur, yavas test modu)" } else { "HIZLI & TEMIZ SHADER (ONERILEN - RELAY=2 + TDR Chunk + Eviction, cokmesiz)" }
         $rtTxt   = if ($rtEnabled) { "ACIK  (UYARI: 8GB VRAM'de +3GB yer & cokme riski!)" } else { "KAPALI + SABIT AYDINLATMA 0.18 (Yuzler & gece sahneleri NET AYDINLIK!)" }
         $fsrTxt  = if ($useFsr)    { "FSR4 (Yalniz sabit 1280x720)" } else { "OYUNUN TEMPORAL UPSCALER'I (Gecerli olcekler 0.5-1.0)" }
         $modeCol = if ($turboMode) { "Yellow" } else { "Green" }
@@ -40,7 +40,7 @@ if (-not $Preset) {
 
         Write-Host "============================================================================" -ForegroundColor Magenta
         Write-Host "                           C L A W Z   G T A   V I                          " -ForegroundColor Cyan
-        Write-Host "         RX 7600 8GB | Aydinlik Yuzler + Hizli & Temiz DX12 Motor           " -ForegroundColor Cyan
+        Write-Host "         RX 7600 8GB | Aydinlik Yuzler + 30 FPS Ara Sahne + Cokmesiz        " -ForegroundColor Cyan
         Write-Host "============================================================================" -ForegroundColor Magenta
         Write-Host ""
         Write-Host ("  [T] Motor Modu       : {0}" -f $modeTxt) -ForegroundColor $modeCol
@@ -48,11 +48,11 @@ if (-not $Preset) {
         Write-Host ("  [F] Upscaler         : {0}" -f $fsrTxt) -ForegroundColor $fsrCol
         Write-Host ""
         Write-Host "  Grafik / Performans Kalitesi Sec (Hepsi gecerli 0.5-1.0 olcekte):" -ForegroundColor White
-        Write-Host "   [1] ULTRA LOW  (Maks FPS)     - 720p Cikis  x0.50 (640x360)  | 1280 MB" -ForegroundColor Green
-        Write-Host "   [2] LOW        (ONERILEN 8GB) - 720p Cikis  x0.67 (854x480)  | 1536 MB" -ForegroundColor Cyan
-        Write-Host "   [3] MEDIUM     (Dengeli)      - 1080p Cikis x0.50 (960x540)  | 1536 MB" -ForegroundColor Yellow
-        Write-Host "   [4] HIGH       (Kalite)       - 1080p Cikis x0.75 (1440x810) | 1536 MB" -ForegroundColor DarkYellow
-        Write-Host "   [5] VERY HIGH / ULTRA         - Series X    x1.00 (1080p)    | 1536 MB" -ForegroundColor Red
+        Write-Host "   [1] ULTRA LOW  (30 FPS Ara Sahne) - 720p Cikis  x0.50 (640x360)  | 1280 MB + Mip-1" -ForegroundColor Green
+        Write-Host "   [2] LOW        (ONERILEN 8GB/30)  - 720p Cikis  x0.67 (854x480)  | 1536 MB + CutsceneFast" -ForegroundColor Cyan
+        Write-Host "   [3] MEDIUM     (Dengeli)          - 1080p Cikis x0.50 (960x540)  | 1536 MB" -ForegroundColor Yellow
+        Write-Host "   [4] HIGH       (Kalite)           - 1080p Cikis x0.75 (1440x810) | 1536 MB" -ForegroundColor DarkYellow
+        Write-Host "   [5] VERY HIGH / ULTRA             - Series X    x1.00 (1080p)    | 1536 MB" -ForegroundColor Red
         Write-Host ""
         Write-Host "   [M] Canli Kullanim + Darbogaz Analiz Ekranlarini Ac" -ForegroundColor DarkGray
         Write-Host "============================================================================" -ForegroundColor Magenta
@@ -88,18 +88,31 @@ Start-Sleep -Milliseconds 300
 # Eski VICTORY_* degiskenlerini temizle
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
-# === TEMIZ & KARARLI ORTAK TEMEL (Upstream -Safe uyumlu, sifir shader bozulmasi) ===
-# PORT_CBV=0: Standart DXIL shader kullanir (shader bozulmalarini engeller).
-# CLAMP_WAITS=1 (varsayilan): ExecuteIndirect oncesi tam UAV bariyeri (0x887A0007 onler).
+# === TEMIZ & KARARLI ORTAK TEMEL (RX 7600 8GB + 16GB RAM, cokmesiz + 30 FPS) ===
+# PORT_CBV=0: Standart DXIL shader kullanir (kemik/model bozulmasini engeller).
+# CBV_DIRECT=1: 256-hizali tablo CBV'lerini CPU kopyasi/Fill beklemesi olmadan baglar.
+# CLAMP_WAITS=ON: ExecuteIndirect oncesi tam UAV bariyeri (0x887A0007 onler).
+# SUBMIT_CHUNK=8: Agir sahne gecislerinde 2 sn Windows TDR asimini onler.
+# RDNA_FLOAT=0: RDNA 3 (RX 7600) mor nokta / NaN precision bozulmasini kapatir.
+# RESIDENCY=1 + LIMITED=1: 8GB VRAM / 16GB RAM icin otomatik pool reclaim ve tahliye.
 $env:VICTORY_NO_WATCHDOG              = '1'
 $env:VICTORY_PLANES                   = '1'
 $env:VICTORY_PORT_CONSTANTS           = '0'
 $env:VICTORY_PORT_CBV                 = '0'
+$env:VICTORY_CBV_DIRECT               = '1'
 $env:VICTORY_UP_QUEUE                 = '0'
 $env:VICTORY_LEVELS_ON_DEMAND         = '1'
 $env:VICTORY_RIPE_BLOCKS              = '6'
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1280'
-$env:VICTORY_FRAME_INTERVAL_MS        = '16.667'
+$env:VICTORY_CARD_ROOM_FOR_BUFFERS    = '1'
+$env:VICTORY_RESIDENCY                = '1'
+$env:VICTORY_RESIDENCY_LIMITED        = '1'
+$env:VICTORY_SUBMIT_CHUNK             = '8'
+$env:VICTORY_SWEEP_SETTLE_MS          = '4000'
+$env:VICTORY_RDNA_FLOAT               = '0'
+$env:VICTORY_FALLBACK_SHADER          = '1'
+$env:VICTORY_DYNAMIC_SLOTS            = '524288'
+$env:VICTORY_FRAME_INTERVAL_MS        = '33.333'
 $env:VICTORY_PIPELINE_WAIT_MS         = '120'
 $env:VICTORY_SCREEN_WAIT_MS           = '10000'
 $env:VICTORY_SHOW_AFTER               = '1'
@@ -116,6 +129,7 @@ $env:VICTORY_TITLE_PRIORITIES         = '0'
 # uzerine sifir yaziyor (texture.rs:376-388). Doku butunlugu once gelir.
 $env:VICTORY_TEXTURE_NO_WAIT          = '0'
 $env:VICTORY_TEXTURE_FILL             = '0'
+$env:VICTORY_TEXTURE_STAGE_MS         = '32'
 # Erken upload'larin ilk kare siyah/gri cikmasi ahead.rs:1-7'de belgeli.
 $env:VICTORY_UPLOAD_AHEAD             = '0'
 $env:VICTORY_SEND_KEPT_MB             = '128'
@@ -182,28 +196,38 @@ $outRes = '1920x1080'
 $scale = '0.6667'
 switch ($Preset) {
     'ultralow' {
-        $presetLabel = 'ULTRA LOW (720p x0.50 = 640x360)'
+        $presetLabel = 'ULTRA LOW (720p x0.50 = 640x360 | 30 FPS Ara Sahne)'
         $outRes = '1280x720'
         $scale = '0.5'
         $env:VICTORY_TEXTURE_BUDGET_MB = '1280'
+        $env:VICTORY_TEXTURE_DROP_MIPS = '1'
+        $env:VICTORY_CUTSCENE_FAST     = '1'
+        if (-not $rtEnabled) { $env:VICTORY_RT_SKIP_EXTRA = '1' }
     }
     'low' {
-        $presetLabel = 'LOW (720p x0.67 = 854x480)'
+        $presetLabel = 'LOW (720p x0.67 = 854x480 | 30 FPS Ara Sahne)'
         $outRes = '1280x720'
         $scale = '0.6667'
         $env:VICTORY_TEXTURE_BUDGET_MB = '1536'
+        $env:VICTORY_TEXTURE_DROP_MIPS = '0'
+        $env:VICTORY_CUTSCENE_FAST     = '1'
+        if (-not $rtEnabled) { $env:VICTORY_RT_SKIP_EXTRA = '1' }
     }
     'medium' {
         $presetLabel = 'MEDIUM (1080p x0.50 = 960x540)'
         $outRes = '1920x1080'
         $scale = '0.5'
         $env:VICTORY_TEXTURE_BUDGET_MB = '1536'
+        $env:VICTORY_TEXTURE_DROP_MIPS = '0'
+        $env:VICTORY_CUTSCENE_FAST     = '0'
     }
     'high' {
         $presetLabel = 'HIGH (1080p x0.75 = 1440x810)'
         $outRes = '1920x1080'
         $scale = '0.75'
         $env:VICTORY_TEXTURE_BUDGET_MB = '1536'
+        $env:VICTORY_TEXTURE_DROP_MIPS = '0'
+        $env:VICTORY_CUTSCENE_FAST     = '0'
     }
     'ultra' {
         $presetLabel = 'VERY HIGH / ULTRA (Series X 1080p x1.0)'
@@ -211,6 +235,8 @@ switch ($Preset) {
         $outRes = '1920x1080'
         $scale = '1.0'
         $env:VICTORY_TEXTURE_BUDGET_MB = '1536'
+        $env:VICTORY_TEXTURE_DROP_MIPS = '0'
+        $env:VICTORY_CUTSCENE_FAST     = '0'
     }
 }
 
@@ -220,6 +246,7 @@ $env:VICTORY_RELAY            = '2'
 $env:VICTORY_PORT_CBV         = '0'
 $env:VICTORY_PORT_DESCRIPTORS = '0'
 $env:VICTORY_CLAMP_WAITS      = 'ON'
+$env:RUST_LOG                 = 'error'
 
 # === UPSCALER & CIKIS GUVENLIGI ===
 if ($useFsr -and $consoleProfile -eq 'series-s') {
@@ -246,7 +273,8 @@ Write-Host ""
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil   : $presetLabel  |  $modeBadge  |  $rtBadge" -ForegroundColor Cyan
 Write-Host "  Cikis    : $fsrBadge | Konsol=$consoleProfile | Doku=$($env:VICTORY_TEXTURE_BUDGET_MB) MB" -ForegroundColor White
-Write-Host "  Shader   : Standart DXIL (PORT_CBV=0, CLAMP_WAITS=ON, RT_SKIP=Guvenli)" -ForegroundColor Green
+Write-Host "  Shader   : Standart DXIL (PORT_CBV=0 + CBV_DIRECT=1, RDNA_FLOAT=0, CLAMP_WAITS=ON)" -ForegroundColor Green
+Write-Host "  Kararli  : 30 FPS (33.3ms) | TDR Chunk=8 | Eviction=ON | DynamicSlots=524288" -ForegroundColor Green
 Write-Host "  Not      : Intro/ara sahneyi gecmek icin oyun penceresinde Enter'a basili tut." -ForegroundColor Yellow
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host ""

@@ -40,17 +40,14 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// On 8 GB cards (budget <= 9 GiB) empty blocks are capped at [`SPARE`] so
+/// unused 64 MiB texture blocks never starve UAV/target/geometry allocations.
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
-        return;
-    }
-    // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
-    // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
+    let tight_vram = memory.is_some_and(|[budget, ..]| budget > 0 && budget <= (9u64 << 30));
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let keep = crate::host::keep_freed() && !pressure && !tight_vram;
+    let limit = spares(memory, keep);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
@@ -59,12 +56,25 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
-        } else if pressure {
+        } else if pressure || tight_vram {
             1
         } else {
             limit
         };
         pool.reclaim(tick, staging_limit, true);
+    }
+}
+
+/// Immediately drops all rested empty texture and staging pool blocks on
+/// `E_OUTOFMEMORY`, without blocking if a pool lock is currently held.
+pub(crate) fn emergency_reclaim() {
+    SPARES.store(0, Ordering::Relaxed);
+    let tick = now();
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, 0, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(tick, 0, true);
     }
 }
 

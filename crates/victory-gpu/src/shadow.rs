@@ -3166,6 +3166,7 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+    trim_exact();
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -5752,11 +5753,12 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
-    /// The largest, and no view the title made on purpose: off its dwords.
+    const MANY: usize = 128;
+    const LATELY: u64 = 256;
+    /// The largest, and no view the title made on purpose: allow 2-byte aligned
+    /// typed views (e.g. R16 index/skinning buffers) as well as 4-byte aligned.
     const MOST: u64 = 64 << 20;
-    if len == 0 || len > MOST || !address.is_multiple_of(4) {
+    if len == 0 || len > MOST || !address.is_multiple_of(2) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -5785,6 +5787,26 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Drops idle single-view copies in [`EXACT`] that no list or descriptor slot
+/// currently references (called from sweeps and emergency eviction).
+pub(crate) fn trim_exact() {
+    let Ok(mut guard) = EXACT.try_lock() else {
+        return;
+    };
+    let mut freed = Vec::new();
+    guard.1.retain(|_, (shadow, _)| {
+        let keep = Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1;
+        if !keep {
+            freed.push(shadow.clone());
+        }
+        keep
+    });
+    drop(guard);
+    for shadow in freed {
+        crate::host::retire(shadow);
+    }
 }
 
 /// Copies of single views' bytes made since the start.

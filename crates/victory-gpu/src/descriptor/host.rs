@@ -1352,7 +1352,11 @@ fn off_elements(offset: u64, stride: u32, raw: bool, element: u64, has_raw_twins
     if raw || needs_raw {
         !offset.is_multiple_of(16)
     } else if stride > 0 {
-        !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
+        if !stride.is_multiple_of(4) {
+            !offset.is_multiple_of(u64::from(stride))
+        } else {
+            !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
+        }
     } else {
         element > 0 && !offset.is_multiple_of(element)
     }
@@ -1612,16 +1616,18 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // Honor explicit `VICTORY_DYNAMIC_SLOTS` on 1M-view heaps too (capped
+        // at half the heap) so busy frames do not drop draw/model tables.
+        return asked.map_or(DYNAMIC, |n| n.clamp(DYNAMIC, (null / 2).max(DYNAMIC)));
     }
+    let most = asked.unwrap_or(DYNAMIC << 2);
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
@@ -4237,7 +4243,7 @@ fn twin_uav(
 /// whole 256s, and at most the 64 KiB a shader can index. The host removes
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
-fn constant_bytes(size: u32) -> u32 {
+pub(crate) fn constant_bytes(size: u32) -> u32 {
     const LARGEST: u32 = 64 << 10;
     size.min(LARGEST).next_multiple_of(256)
 }
@@ -4509,26 +4515,70 @@ fn make_twinned(
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
                 // A title-placed texture can be written through a host copy of
-                // its own bytes when its description allows unordered access,
-                // the same way a shader view of one gets a resource.
+                // its own bytes (or its colour twin if depth+UAV, or an aliased
+                // target, or a UAV-flagged placed copy when the console omitted
+                // the PC UAV flag).
                 if *unordered {
                     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                     let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
-                    if let Some(placed) = crate::resource::texture_at(address, resource)
-                        && let Some(texture) = crate::resource::host_resource(placed)
-                    {
-                        let mut view = uav_desc(words);
-                        if fits(texture, Some(&mut view.Format), true) {
-                            // SAFETY: a live host copy and a slot of our heap.
+                    let try_uav = |res: crate::object::This| -> Option<Kept> {
+                        let base_view = uav_desc(words);
+                        if let Some((twin, mut view)) = crate::resource::twin_resource(res)
+                            .and_then(|t| Some((t, twin_uav(t, Some(&base_view))?)))
+                            .or_else(|| {
+                                let t = crate::resource::twin_plane_resource(res)?;
+                                Some((t, twin_uav(t, Some(&base_view))?))
+                            })
+                            && fits(twin, Some(&mut view.Format), true)
+                        {
+                            // SAFETY: a live colour twin and a slot of our heap.
                             unsafe {
                                 device.CreateUnorderedAccessView(
-                                    texture,
+                                    twin,
                                     None::<&ID3D12Resource>,
                                     Some(std::ptr::from_ref(&view)),
                                     at,
                                 )
                             };
-                            return Some(Some(texture.clone()));
+                            return Some(Some(twin.clone()));
+                        }
+                        if let Some(texture) = crate::resource::host_resource(res) {
+                            let mut view = base_view;
+                            if fits(texture, Some(&mut view.Format), true) {
+                                // SAFETY: a live host copy and a slot of our heap.
+                                unsafe {
+                                    device.CreateUnorderedAccessView(
+                                        texture,
+                                        None::<&ID3D12Resource>,
+                                        Some(std::ptr::from_ref(&view)),
+                                        at,
+                                    )
+                                };
+                                return Some(Some(texture.clone()));
+                            }
+                        }
+                        None
+                    };
+                    if let Some(placed) = crate::resource::texture_at(address, resource) {
+                        if let Some(kept) = try_uav(placed) {
+                            return Some(kept);
+                        }
+                        if let Some(alias) = crate::resource::alias_of(placed)
+                            && let Some(kept) = try_uav(alias)
+                        {
+                            return Some(kept);
+                        }
+                    }
+                    // If the placed description lacked PC's ALLOW_UNORDERED_ACCESS
+                    // bit (0x4) and is not a depth texture (0x2), try creating a
+                    // UAV-capable placed texture at the same address.
+                    if resource[12] & 0x6 == 0 {
+                        let mut uav_res = *resource;
+                        uav_res[12] |= 0x4;
+                        if let Some(placed) = crate::resource::texture_at(address, &uav_res)
+                            && let Some(kept) = try_uav(placed)
+                        {
+                            return Some(kept);
                         }
                     }
                 }

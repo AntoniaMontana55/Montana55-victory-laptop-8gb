@@ -355,6 +355,13 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// Whether broken/refused pixel shaders fall back to a safe depth-only pipeline
+/// instead of dropping geometry or crashing (`VICTORY_FALLBACK_SHADER=0` disables).
+fn fallback_shader_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_SHADER").is_none_or(|v| v != "0"))
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -434,7 +441,7 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
-        let stages = if let Some(cs) = compute {
+        let mut stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let first = match (mesh, find("vertex")) {
@@ -449,10 +456,27 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
+        let mut fallback_depth_only = false;
         {
             let _shaders = crate::timeline::span("pipeline: get translated shaders");
-            for (s, _) in &stages {
-                s.translated()?;
+            stages[0].0.translated()?;
+            if stages.len() > 1 && stages[1].0.translated().is_none() {
+                if fallback_shader_on()
+                    && g.is_some_and(|gs| {
+                        gs.depth_format != DXGI_FORMAT_UNKNOWN
+                            && gs.depth.DepthEnable.as_bool()
+                            && gs.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+                    })
+                {
+                    tracing::warn!(
+                        ?shaders,
+                        "pixel shader failed translation: falling back to safe depth-only pipeline"
+                    );
+                    stages.truncate(1);
+                    fallback_depth_only = true;
+                } else {
+                    return None;
+                }
             }
         }
         let host = host()?;
@@ -618,13 +642,20 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
-            let made = super::library::pipeline(
+            let mut made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
+            if let Err(e) = &made
+                && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+            {
+                host.emergency_evict();
+                // SAFETY: retry once after reclaiming idle VRAM/RAM.
+                made = unsafe { host.device.CreateComputePipelineState(&desc) };
+            }
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -678,7 +709,14 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let mut made = mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name);
+            if let Err(e) = &made
+                && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+            {
+                host.emergency_evict();
+                made = mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name);
+            }
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -776,6 +814,12 @@ impl HostPipeline {
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            host.emergency_evict();
+            made = make(&desc, &name(rect_gs.as_ref()));
+        }
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
@@ -783,6 +827,29 @@ impl HostPipeline {
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
             made = make(&desc, &name(None));
+        }
+        if fallback_depth_only && desc.NumRenderTargets > 0 {
+            desc.NumRenderTargets = 0;
+            desc.RTVFormats = [DXGI_FORMAT_UNKNOWN; 8];
+            desc.BlendState = D3D12_BLEND_DESC::default();
+            if made.is_err() {
+                made = make(&desc, &name(None));
+            }
+        } else if made.is_err()
+            && fallback_shader_on()
+            && desc.PS.BytecodeLength > 0
+            && g.depth_format != DXGI_FORMAT_UNKNOWN
+        {
+            // Driver refused the pixel shader (e.g. RDNA 3 compiler/precision
+            // rejection): fall back to a safe depth-only PSO so geometry still
+            // populates depth without crashing or hanging the device.
+            tracing::warn!(?shaders, "host refused pixel shader: retrying with safe depth-only fallback");
+            desc.PS = D3D12_SHADER_BYTECODE::default();
+            desc.NumRenderTargets = 0;
+            desc.RTVFormats = [DXGI_FORMAT_UNKNOWN; 8];
+            desc.BlendState = D3D12_BLEND_DESC::default();
+            let fb_name = super::library::name("graphics fallback", &root_blob, &[&code_bytes(&code(0))], &state);
+            made = make(&desc, &fb_name);
         }
         let pso = match made {
             Ok(pso) => pso,

@@ -3625,6 +3625,26 @@ impl State {
                                 None => crate::port_cbv::copied(true),
                             }
                         }
+                        // `VICTORY_CBV_DIRECT=1`: with standard DXIL (`PORT_CBV=0`),
+                        // bind 256-byte-aligned table CBVs directly at their host
+                        // copy (as `root_view` does) to eliminate CPU scratch copies
+                        // and `Fill` relay stalls without altering shaders.
+                        static CBV_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        if *CBV_DIRECT.get_or_init(|| {
+                            std::env::var_os("VICTORY_CBV_DIRECT").is_some_and(|v| v == "1")
+                        }) {
+                            let padded = u64::from(crate::descriptor::host::constant_bytes(size));
+                            if padded > 0
+                                && let Some(shadow) = crate::shadow::find(address, padded)
+                            {
+                                let gpu = shadow.gpu(address);
+                                if gpu.is_multiple_of(256) && shadow.left(address) >= padded {
+                                    shadow.refresh(list, address, padded);
+                                    host.constant_at(index, &shadow.buffer, gpu, size);
+                                    continue;
+                                }
+                            }
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

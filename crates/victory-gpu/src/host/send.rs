@@ -179,6 +179,15 @@ pub(super) fn give_back(memory: Memory) {
     }
 }
 
+/// Releases idle send upload buffers immediately when memory is tight.
+pub(super) fn trim_spare() {
+    let freed = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *spare)
+    };
+    drop(freed);
+}
+
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
 /// microseconds of taking them out of the CPU sides.
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
