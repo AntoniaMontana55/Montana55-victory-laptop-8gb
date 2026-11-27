@@ -3921,15 +3921,44 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
-        if element == 0 || offset % element != 0 {
-            once!(
-                offset,
-                element,
-                "buffer view not on an element of its host copy"
-            );
+        if element == 0 {
+            once!(offset, element, "buffer view not on an element of its host copy");
             return None;
         }
-        buffer.FirstElement += offset / element;
+        if offset % element != 0 {
+            // RDNA 3 / 16-byte alignment fallback: if the view starts on a
+            // 16-byte boundary and spans whole dwords, promote untyped/structured
+            // views to raw R32_TYPELESS; otherwise mirror an exact host copy so
+            // vertex/index/skinning buffers never become null.
+            let view_start_in_shadow = offset.saturating_add(buffer.FirstElement.saturating_mul(element));
+            let view_bytes_len = u64::from(buffer.NumElements).saturating_mul(element);
+            if desc.Format == DXGI_FORMAT_UNKNOWN
+                && view_start_in_shadow.is_multiple_of(16)
+                && view_bytes_len > 0
+                && view_bytes_len.is_multiple_of(4)
+                && let Ok(dwords) = u32::try_from(view_bytes_len / 4)
+            {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                *buffer = D3D12_BUFFER_SRV {
+                    FirstElement: view_start_in_shadow / 4,
+                    NumElements: dwords,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                };
+            } else if let Some(exact) = crate::shadow::exact(start, view_bytes_len.max(element)) {
+                shadow = exact;
+                buffer.FirstElement = 0;
+            } else {
+                once!(
+                    offset,
+                    element,
+                    "buffer view not on an element of its host copy"
+                );
+                return None;
+            }
+        } else {
+            buffer.FirstElement += offset / element;
+        }
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -4036,6 +4065,7 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
+    let mut promoted_raw = false;
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
         .then(|| raw_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride))
         .flatten();
@@ -4044,17 +4074,42 @@ fn buffer_uav(
         buffer.NumElements = count;
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    } else {
-        if element == 0 || offset % element != 0 {
+        promoted_raw = true;
+    } else if element == 0 {
+        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        return None;
+    } else if offset % element != 0 {
+        // RDNA 3 / 16-byte alignment tolerance + forced exact host mirror so
+        // skinning/bone UAVs are never silently nulled out.
+        let view_start_in_shadow = offset.saturating_add(buffer.FirstElement.saturating_mul(element));
+        let view_bytes_len = u64::from(buffer.NumElements).saturating_mul(element);
+        if desc.Format == DXGI_FORMAT_UNKNOWN
+            && view_start_in_shadow.is_multiple_of(16)
+            && view_bytes_len > 0
+            && view_bytes_len.is_multiple_of(4)
+            && let Ok(dwords) = u32::try_from(view_bytes_len / 4)
+        {
+            buffer.FirstElement = view_start_in_shadow / 4;
+            buffer.NumElements = dwords;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            promoted_raw = true;
+        } else if let Some(exact) = crate::shadow::exact(start, view_bytes_len.max(element))
+            && (unsafe { exact.buffer.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0)
+        {
+            shadow = exact;
+            buffer.FirstElement = 0;
+        } else {
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
+    } else {
         buffer.FirstElement += offset / element;
     }
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-    if window.is_some() {
+    if promoted_raw {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -4544,6 +4599,14 @@ fn make_twinned(
                         }
                         if let Some(texture) = crate::resource::host_resource(res) {
                             let mut view = base_view;
+                            // D3D12 forbids sRGB formats on UAVs; coerce to the
+                            // matching linear UNORM format so placed UAV mirrors succeed.
+                            view.Format = match view.Format {
+                                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DXGI_FORMAT_R8G8B8A8_UNORM,
+                                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DXGI_FORMAT_B8G8R8A8_UNORM,
+                                DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => DXGI_FORMAT_B8G8R8X8_UNORM,
+                                other => other,
+                            };
                             if fits(texture, Some(&mut view.Format), true) {
                                 // SAFETY: a live host copy and a slot of our heap.
                                 unsafe {

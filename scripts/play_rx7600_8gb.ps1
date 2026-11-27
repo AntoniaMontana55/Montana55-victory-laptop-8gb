@@ -1,4 +1,4 @@
-# clawz GTA VI — Kararli & Temiz Shader Baslaticisi (RX 7600 8 GB)
+﻿# clawz GTA VI — Kararli & Temiz Shader Baslaticisi (RX 7600 8 GB)
 param(
     [ValidateSet('', 'ultralow', 'low', 'medium', 'high', 'ultra')]
     [string]$Preset = '',
@@ -89,16 +89,17 @@ Start-Sleep -Milliseconds 300
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
 # === TEMIZ & KARARLI ORTAK TEMEL (RX 7600 8GB + 16GB RAM, cokmesiz + 30 FPS) ===
-# PORT_CBV=0: Standart DXIL shader kullanir (kemik/model bozulmasini engeller).
+# PORT_CBV=1 + PORT_DESCRIPTORS=1: yeni sahneye giren modellerin dunya/kemik matrisleri kesilmeden cizilir.
 # CBV_DIRECT=1: 256-hizali tablo CBV'lerini CPU kopyasi/Fill beklemesi olmadan baglar.
 # CLAMP_WAITS=ON: ExecuteIndirect oncesi tam UAV bariyeri (0x887A0007 onler).
-# SUBMIT_CHUNK=8: Agir sahne gecislerinde 2 sn Windows TDR asimini onler.
-# RDNA_FLOAT=0: RDNA 3 (RX 7600) mor nokta / NaN precision bozulmasini kapatir.
+# SUBMIT_CHUNK=8 + SHADER_LOOP_LIMIT=16384: agir sahne gecislerinde 2 sn Windows TDR asimini onler.
+# RDNA_FLOAT=0 + FALLBACK_SHADER=1: RDNA 3 (RX 7600) mor nokta / precision bozulmasini kapatir.
 # RESIDENCY=1 + LIMITED=1: 8GB VRAM / 16GB RAM icin otomatik pool reclaim ve tahliye.
 $env:VICTORY_NO_WATCHDOG              = '1'
 $env:VICTORY_PLANES                   = '1'
 $env:VICTORY_PORT_CONSTANTS           = '0'
-$env:VICTORY_PORT_CBV                 = '0'
+$env:VICTORY_PORT_CBV                 = '1'
+$env:VICTORY_PORT_DESCRIPTORS         = '1'
 $env:VICTORY_CBV_DIRECT               = '1'
 $env:VICTORY_UP_QUEUE                 = '0'
 $env:VICTORY_LEVELS_ON_DEMAND         = '1'
@@ -111,6 +112,7 @@ $env:VICTORY_SUBMIT_CHUNK             = '8'
 $env:VICTORY_SWEEP_SETTLE_MS          = '4000'
 $env:VICTORY_RDNA_FLOAT               = '0'
 $env:VICTORY_FALLBACK_SHADER          = '1'
+$env:VICTORY_SHADER_LOOP_LIMIT        = '16384'
 $env:VICTORY_DYNAMIC_SLOTS            = '524288'
 $env:VICTORY_FRAME_INTERVAL_MS        = '33.333'
 $env:VICTORY_PIPELINE_WAIT_MS         = '120'
@@ -133,7 +135,7 @@ $env:VICTORY_TEXTURE_STAGE_MS         = '32'
 # Erken upload'larin ilk kare siyah/gri cikmasi ahead.rs:1-7'de belgeli.
 $env:VICTORY_UPLOAD_AHEAD             = '0'
 $env:VICTORY_SEND_KEPT_MB             = '128'
-$env:VICTORY_WINDOW_KB                = '256'
+$env:VICTORY_WINDOW_KB                = '1024'
 $env:VICTORY_WINDOW_TAILS             = '1'
 $env:VICTORY_MEMORY_MAP               = '0'
 $env:VICTORY_PIPELINE_BOOK            = '0'
@@ -141,26 +143,26 @@ $env:VICTORY_VIEW_BYTES               = '1'
 $env:RUST_LOG                         = 'error'
 
 if ($turboMode) {
-    # ULTRA-SAFE SENKRON: RELAY=2 korunur, diger asenkron yollar kapanir
+    # ULTRA-SAFE SENKRON: RELAY=2, PORT_CBV=1, PORT_DESCRIPTORS=1 korunur
     $env:VICTORY_RELAY             = '2'
     $env:VICTORY_THIN              = '0'
     $env:VICTORY_ASYNC_SUBMIT      = '0'
     $env:VICTORY_UPLOAD_AHEAD      = '0'
-    $env:VICTORY_PORT_DESCRIPTORS  = '0'
+    $env:VICTORY_PORT_DESCRIPTORS  = '1'
     $env:VICTORY_PORT_GUARD        = '0'
     $env:VICTORY_PORT_JOURNAL      = '0'
     $env:VICTORY_JOIN_BARRIERS     = '0'
     $env:VICTORY_UNDER_WIDE        = '0'
     $env:VICTORY_LAND_ECHO         = '0'
 } else {
-    # HIZLI & TEMIZ MOD: Asenkron CPU/GPU (RELAY=2 + THIN + Port #6/#7) ama shader'a dokunmaz (PORT_CBV=0, PORT_DESCRIPTORS=0, CLAMP_WAITS=ON)
+    # HIZLI & TEMIZ MOD: RELAY=2 + THIN + Port #2/#5/#6/#7 + CLAMP_WAITS=ON
     $env:VICTORY_RELAY             = '2'
     $env:VICTORY_RELAY_COPY        = '1'
     $env:VICTORY_THIN              = '1'
     $env:VICTORY_THIN_THREADS      = '6'
     $env:VICTORY_ASYNC_SUBMIT      = '1'
     $env:VICTORY_UPLOAD_AHEAD      = '0'
-    $env:VICTORY_PORT_DESCRIPTORS  = '0'
+    $env:VICTORY_PORT_DESCRIPTORS  = '1'
     $env:VICTORY_PORT_GUARD        = '1'
     $env:VICTORY_PORT_JOURNAL      = '1'
     $env:VICTORY_JOIN_BARRIERS     = '1'
@@ -240,11 +242,11 @@ switch ($Preset) {
     }
 }
 
-# === KORUNAN AYARLAR: hicbir profil bunlari ezmez ===
+# === KORUNAN AYARLAR + TAM MODEL YUKLEME: hicbir profil bunlari ezmez ===
 $env:VICTORY_AMBIENT          = 'constant:0.18'
 $env:VICTORY_RELAY            = '2'
-$env:VICTORY_PORT_CBV         = '0'
-$env:VICTORY_PORT_DESCRIPTORS = '0'
+$env:VICTORY_PORT_CBV         = '1'
+$env:VICTORY_PORT_DESCRIPTORS = '1'
 $env:VICTORY_CLAMP_WAITS      = 'ON'
 $env:RUST_LOG                 = 'error'
 
@@ -273,7 +275,7 @@ Write-Host ""
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil   : $presetLabel  |  $modeBadge  |  $rtBadge" -ForegroundColor Cyan
 Write-Host "  Cikis    : $fsrBadge | Konsol=$consoleProfile | Doku=$($env:VICTORY_TEXTURE_BUDGET_MB) MB" -ForegroundColor White
-Write-Host "  Shader   : Standart DXIL (PORT_CBV=0 + CBV_DIRECT=1, RDNA_FLOAT=0, CLAMP_WAITS=ON)" -ForegroundColor Green
+Write-Host "  Shader   : PORT_CBV=1 + PORT_DESCRIPTORS=1 + RDNA_FLOAT=0 + LOOP_LIMIT=16384 + CLAMP_WAITS=ON" -ForegroundColor Green
 Write-Host "  Kararli  : 30 FPS (33.3ms) | TDR Chunk=8 | Eviction=ON | DynamicSlots=524288" -ForegroundColor Green
 Write-Host "  Not      : Intro/ara sahneyi gecmek icin oyun penceresinde Enter'a basili tut." -ForegroundColor Yellow
 Write-Host "============================================================================" -ForegroundColor Magenta

@@ -153,8 +153,74 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
-/// Sleeps for `duration` with sub-millisecond accuracy so 33.333 ms (30 FPS)
-/// pacing does not overshoot due to OS scheduler jitter.
+/// Sleeps for `duration` with sub-millisecond accuracy on Windows (using
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) so Windows 10's 15.6 ms timer tick
+/// does not drop 33.333 ms (30 FPS) pacing down to 15-20 FPS.
+#[cfg(windows)]
+fn precise_sleep(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + duration;
+    const SPIN_MARGIN: Duration = Duration::from_micros(600);
+    if let Some(coarse) = duration.checked_sub(SPIN_MARGIN)
+        && !coarse.is_zero()
+    {
+        thread_local! {
+            static TIMER: std::cell::Cell<windows_sys::Win32::Foundation::HANDLE> =
+                const { std::cell::Cell::new(std::ptr::null_mut()) };
+        }
+        let timer = TIMER.with(|cell| {
+            let h = cell.get();
+            if !h.is_null() {
+                return h;
+            }
+            // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (0x2), Win10 1803+.
+            // SAFETY: null name/security attributes, standard Win32 handle creation.
+            let made = unsafe {
+                windows_sys::Win32::System::Threading::CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0x0000_0002,
+                    0x001F_0003,
+                )
+            };
+            if !made.is_null() {
+                cell.set(made);
+            }
+            made
+        });
+        if !timer.is_null() {
+            let ticks_100ns = -((coarse.as_nanos() / 100).max(1) as i64);
+            // SAFETY: valid waitable timer handle and stack i64 pointer.
+            let ok = unsafe {
+                windows_sys::Win32::System::Threading::SetWaitableTimer(
+                    timer,
+                    &ticks_100ns,
+                    0,
+                    None,
+                    std::ptr::null(),
+                    0,
+                )
+            };
+            if ok != 0 {
+                // SAFETY: waiting on our own waitable timer.
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(timer, 1000);
+                }
+            } else {
+                std::thread::sleep(coarse);
+            }
+        } else {
+            std::thread::sleep(coarse);
+        }
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(not(windows))]
 fn precise_sleep(duration: Duration) {
     if duration.is_zero() {
         return;

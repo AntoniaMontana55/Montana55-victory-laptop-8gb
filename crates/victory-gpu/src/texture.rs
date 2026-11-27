@@ -546,10 +546,10 @@ pub(crate) fn let_go_idle() {
 /// Emergency non-blocking trim of idle texture staging buffers on `E_OUTOFMEMORY`.
 pub(crate) fn trim_idle_now() {
     use std::sync::atomic::Ordering::Relaxed;
-    let Ok(mut map) = STAGING.try_lock() else {
+    let Ok(mut guard) = STAGING.try_lock() else {
         return;
     };
-    let Some(map) = map.as_mut() else {
+    let Some(map) = guard.as_mut() else {
         return;
     };
     if map.is_empty() {
@@ -566,7 +566,7 @@ pub(crate) fn trim_idle_now() {
         }
         keep
     });
-    drop(map);
+    drop(guard);
     drop(freed);
 }
 

@@ -12,5 +12,13 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
+rem Korunan ayarlar + tam model yukleme + sessiz log
+set "VICTORY_AMBIENT=constant:0.18"
+set "VICTORY_RELAY=2"
+set "VICTORY_CLAMP_WAITS=ON"
+set "VICTORY_PORT_CBV=1"
+set "VICTORY_PORT_DESCRIPTORS=1"
+set "RUST_LOG=error"
+
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
 endlocal

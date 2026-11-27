@@ -4235,9 +4235,9 @@ impl Host {
 
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
-        // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
-            (|| {
+        let create = || -> windows::core::Result<Prelude> {
+            // SAFETY: plain object creation.
+            unsafe {
                 let allocator: ID3D12CommandAllocator =
                     self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
                 let list: ID3D12GraphicsCommandList =
@@ -4245,12 +4245,21 @@ impl Host {
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.Close()?;
                 Ok((allocator, list))
-            })()
+            }
         };
+        let mut made = create();
+        if let Err(e) = &made
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            crate::residency::allocation_error(e);
+            self.emergency_evict();
+            made = create();
+        }
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, "no host list for a prelude");
                 None
             }
