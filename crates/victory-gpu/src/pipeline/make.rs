@@ -81,6 +81,16 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         }
         skip
     });
+    left_out_for_flags(shaders, resolve, activate, extra, cutscene_fast)
+}
+
+fn left_out_for_flags(
+    shaders: &[Arc<Shader>],
+    resolve: bool,
+    activate: bool,
+    extra: bool,
+    cutscene_fast: bool,
+) -> Option<&'static str> {
     if resolve && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray hits without structures");
     }
@@ -98,9 +108,10 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
             return Some("traces RT shadows without structures");
         }
     }
-    // Cutscene 30 FPS profile (`VICTORY_CUTSCENE_FAST=1`): skip expensive
-    // optional DoF, volumetric cloud/fog raymarch and motion-blur compute
-    // passes while preserving all geometry, lighting and `VICTORY_AMBIENT`
+    // Cutscene / 1080p story 30 FPS profile (`VICTORY_CUTSCENE_FAST=1`): skip
+    // expensive optional DoF, volumetric cloud/fog raymarch and lens/post-FX
+    // compute passes while preserving all geometry, character bakes
+    // (`PS_BakeDecorations_*`), lighting and `VICTORY_AMBIENT`
     // (`CS_ScreenProbes_TemporalResolve`) passes intact.
     if cutscene_fast {
         if named(shaders, b"CS_DepthOfField")
@@ -126,8 +137,14 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
             || named(shaders, b"CS_LensFlare")
             || named(shaders, b"CS_SSR_Trace")
             || named(shaders, b"CS_ScreenSpaceReflections")
+            || named(shaders, b"CS_FilmGrain")
+            || named(shaders, b"FilmGrain_")
+            || named(shaders, b"CS_ChromaticAberration")
+            || named(shaders, b"ChromaticAberration_")
+            || named(shaders, b"CS_LensDistortion")
+            || named(shaders, b"CS_Vignette")
         {
-            return Some("optional post-process/SSR pass skipped for 30 FPS target");
+            return Some("optional post-process/SSR/lens pass skipped for 30 FPS story target");
         }
     }
     None
@@ -682,5 +699,26 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    /// Story/cutscene fast profile skips optional post-FX compute passes
+    /// without ever touching character skin bakes or ambient resolve passes.
+    #[test]
+    fn story_fast_skips_optional_post_fx_but_preserves_bakes_and_ambient() {
+        let mk = |stage: &'static str, name: &[u8]| {
+            vec![Arc::new(Shader {
+                stage,
+                hash: "deadbeef00000000".into(),
+                container: name.to_vec(),
+                ambient: None,
+                probe: None,
+                translated: OnceLock::new(),
+            })]
+        };
+        assert!(left_out_for_flags(&mk("compute", b"CS_DepthOfField_Main"), false, false, false, true).is_some());
+        assert!(left_out_for_flags(&mk("compute", b"CS_FilmGrain_Apply"), false, false, false, true).is_some());
+        assert!(left_out_for_flags(&mk("compute", b"CS_ChromaticAberration_CS"), false, false, false, true).is_some());
+        assert!(left_out_for_flags(&mk("compute", b"CS_ScreenProbes_TemporalResolve"), true, true, true, true).is_none());
+        assert!(left_out_for_flags(&mk("pixel", b"PS_BakeDecorations_Skin"), true, true, true, true).is_none());
     }
 }

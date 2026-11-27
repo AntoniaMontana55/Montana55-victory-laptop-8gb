@@ -9564,6 +9564,7 @@ struct Presenter {
     /// Composes a second presented plane over the first ([`crate::compose`]).
     composer: Option<crate::compose::Composer>,
     panel: panel::Panel,
+    subtitles: crate::subtitle::overlay::Subtitles,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -10222,7 +10223,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
+            let sub_capture = p.subtitles.capture_record(self, copy, &back, (width, height), format);
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.subtitles.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10255,12 +10258,11 @@ impl Host {
                     0
                 }
             };
+            p.subtitles.capture_submitted(sub_capture, flown);
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
             }
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = flown;
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -10276,6 +10278,7 @@ impl Host {
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+                p.subtitles.frame();
                 if frame.is_multiple_of(30) {
                     self.memory_safety_valve();
                 }
@@ -10364,6 +10367,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                subtitles: crate::subtitle::overlay::Subtitles::new(),
             })
         }
     }

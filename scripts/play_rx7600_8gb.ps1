@@ -1,12 +1,14 @@
-﻿# clawz GTA VI — Tek Tik Sabit Ayar, %100 Saf DXIL Shader + Tam Model Baslaticisi (RX 7600 8 GB)
+﻿# clawz GTA VI — Tek Tik Sabit Ayar, %100 Saf DXIL + 1080p Hikaye Semasi + Canli TR Altyazi (RX 7600 8 GB)
 param(
-    [ValidateSet('1', '2')]
+    [ValidateSet('1', '2', '3')]
     [string]$Profile = '2',
     [string]$Preset = ''
 )
 $ErrorActionPreference = 'Stop'
 
 if ($Preset -eq 'ultralow') { $Profile = '1' }
+elseif ($Preset -eq 'story') { $Profile = '2' }
+elseif ($Preset -eq 'storyfps') { $Profile = '3' }
 
 $repo    = Split-Path -Parent $PSScriptRoot
 $victory = Join-Path $repo 'target\release\victory.exe'
@@ -34,18 +36,25 @@ Start-Sleep -Milliseconds 300
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
 # Sabit Profil (Menu yok, tek tik):
-# Varsayilan 2 = 1920x1080 FULL HD + 30 FPS + TAM MODEL (RELAY=2, 16MiB Pool, BURY_LAG=8)
 # Profil 1     = 1280x720 HAFIF (Maks FPS / En dusuk VRAM)
+# Varsayilan 2 = 1920x1080 HIKAYE SEMASI + TAM DOKU + 30 FPS (0.6667 = dogal 720p RT -> 1080p cikis)
+# Profil 3     = 1920x1080 HIKAYE MAKS AKICILIK (0.58 ic olcek, acik dunya agir sahneler icin)
 if ($Profile -eq '1') {
-    $profileName     = '1 - 720p MAKS FPS (1280x720 x0.70 | RELAY=2 | %100 Saf Shader)'
+    $profileName     = '1 - 720p MAKS FPS (1280x720 x0.6667 | RELAY=2 | %100 Saf Shader)'
     $outputMode      = '1280x720'
-    $renderScale     = '0.70'
+    $renderScale     = '0.6667'
+    $texBudgetMb     = 'dynamic'
+    $texMax          = '0'
+} elseif ($Profile -eq '3') {
+    $profileName     = '3 - 1080p HIKAYE MAKS FPS (1920x1080 x0.58 | RELAY=2 | BATCH=2 | Dinamik TX)'
+    $outputMode      = '1920x1080'
+    $renderScale     = '0.58'
     $texBudgetMb     = 'dynamic'
     $texMax          = '0'
 } else {
-    $profileName     = '2 - 1080p FULL HD + TAM DOKU (1920x1080 x0.70 | RELAY=2 | 16MiB Pool | Dinamik TX)'
+    $profileName     = '2 - 1080p HIKAYE SEMASI + TAM DOKU (1920x1080 x0.6667 | RELAY=2 | BATCH=2 | Dinamik TX)'
     $outputMode      = '1920x1080'
-    $renderScale     = '0.70'
+    $renderScale     = '0.6667'
     $texBudgetMb     = 'dynamic'
     $texMax          = '0'
 }
@@ -59,8 +68,8 @@ $pipelineWaitMs  = '1500'
 
 # === %100 SAF STANDART DXIL SHADER (25.694 ONBELLEKLE %100 UYUMLU) ===
 # PORT_CBV=0, PORT_DESCRIPTORS=0, PORT_CONSTANTS=0, BVH_MISS=0, FALLBACK_SHADER=0
-# RT_SKIP_* + CUTSCENE_FAST yalnizca bos BVH RT / agir DoF & bulut raymarch compute
-# gecislerini atlar (DXIL shader cevirisini degistirmez, onbellek bozulmaz!).
+# RT_SKIP_* + CUTSCENE_FAST yalnizca bos BVH RT / agir DoF, bulut raymarch & lens/post-FX
+# compute gecislerini atlar (DXIL shader cevirisini degistirmez, onbellek bozulmaz!).
 # AMBIENT=0.85 + AMBIENT_AIR=0.25 -> oda isigina uyumlu aydinlatma + ic mekan sis/isik patlamasi sifir!
 $env:VICTORY_PORT_CONSTANTS           = '0'
 $env:VICTORY_PORT_CBV                 = '0'
@@ -83,34 +92,41 @@ $env:VICTORY_AMBIENT_SETTLE           = '150,2.5,1.0'
 $env:VICTORY_BAKE_EXACT               = '1'
 $env:VICTORY_BAKE_TEXTURES_MS         = '2000'
 
-# === ZAMANLAMA & CIKIS (720p RT = ~750 MB VRAM tasarrufu + 2x GPU hizi, sifir PSO hatasi) ===
+# === ZAMANLAMA, 1920x1080 CIKIS & CANLI SANSURSUZ TURKCE ALTYAZI ===
+# 0.6667 = Series S dogal 2/3 orani (1280x720 ic RT -> 1920x1080 cikis, en dusuk RT VRAM + sifir jitter)
+# VICTORY_SUBS=1 -> alt ortada yuvarlatilmis siyah kutu, ortalanmis beyaz yazi, F8 ac/kapa, tr_subtitles_cache.json
 $env:VICTORY_NO_WATCHDOG              = '1'
 $env:VICTORY_PLANES                   = '1'
 $env:VICTORY_SHOW_AFTER               = '1'
 $env:VICTORY_FRAME_INTERVAL_MS        = '33.333'
 $env:VICTORY_OUTPUT                   = $outputMode
+$env:VICTORY_DISPLAY_MODE             = $outputMode
 $env:VICTORY_UPSCALER                 = '6'
 $env:VICTORY_RENDER_SCALE             = $renderScale
+$env:VICTORY_SUBS                     = '1'
+$env:VICTORY_SUBS_INTERVAL_MS         = '200'
 
-# === HIZ, TAM MODEL & DIRECTSTORAGE STREAMING (RX 7600 8 GB + 16 GB RAM) ===
-# RELAY=2 + LATE_WAIT=3 + ASYNC_SUBMIT=1 -> CPU/GPU paralel calisir (3-4 FPS seri kilidi acilir),
-# Belobug PreludeUpload + release_tables + 720p RT + Dinamik TX bütçesi ile VRAM < 6.4 GiB
-# (Shared tasma sifir, OOM 0x8007000E hatti 6.1 GiB'de korunur!).
+# === 1080p FPS, HIKAYE AKISI & DIRECTSTORAGE STREAMING (RX 7600 8 GB + 16 GB RAM) ===
+# INDIRECT_BATCH=2 + CLAMP_WAITS=0 -> kare basina ~980 indirect clamp -> ~133 gecise duser (~8-10 ms GPU kazanci)
+# CARD_AWAKE=1 -> RX 7600 hikaye/ara sahne CPU aralarinda saat hizini dusurmez (+%15-25 GPU akiciligi)
+# SWEEP_SETTLE_MS=3500 -> ara sahnelerde 1.5 sn'lik gereksiz senkron duraklamalari azalir (OOM valfi anlik calisir)
 $env:VICTORY_RELAY                    = $relayMode
 $env:VICTORY_LATE_WAIT                = $lateWait
 $env:VICTORY_RELAY_COPY               = '1'
-$env:VICTORY_CLAMP_WAITS              = 'ON'
+$env:VICTORY_CLAMP_WAITS              = '0'
 $env:VICTORY_THIN                     = '0'
 $env:VICTORY_UPLOAD_AHEAD             = '0'
 $env:VICTORY_ASYNC_SUBMIT             = $asyncSubmit
 $env:VICTORY_WIDE_BACK                = '1'
 $env:VICTORY_WIDE_REFRESH             = '1'
+$env:VICTORY_WIDE_MERGE               = '1'
 $env:VICTORY_JOIN_COPIES              = '1'
-$env:VICTORY_INDIRECT_BATCH           = '1'
+$env:VICTORY_INDIRECT_BATCH           = '2'
 $env:VICTORY_INDIRECT_WINDOW          = '1'
 $env:VICTORY_CARD_REHASH_RUNS         = '1'
 $env:VICTORY_CARD_STEPS               = '2'
-$env:VICTORY_CARD_AWAKE               = '0'
+$env:VICTORY_CARD_AWAKE               = '1'
+$env:VICTORY_SWEEP_SETTLE_MS          = '3500'
 $env:VICTORY_MAP_THREADS              = '1'
 $env:VICTORY_TITLE_PRIORITIES         = '0'
 $env:VICTORY_UNDER_WIDE               = '0'
@@ -160,15 +176,17 @@ $env:VICTORY_PIPELINE_BOOK            = '0'
 $env:VICTORY_D3D12_DRED               = 'light'
 $env:RUST_LOG                         = 'error'
 
-$Host.UI.RawUI.WindowTitle = "clawz - GTA VI (RX 7600 8GB | Tam Model + Sifir Cokme)"
+$Host.UI.RawUI.WindowTitle = "clawz - GTA VI (RX 7600 8GB | 1080p Hikaye + Canli TR Altyazi)"
 Clear-Host
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "                           C L A W Z   G T A   V I                          " -ForegroundColor Cyan
-Write-Host "         RX 7600 8GB | %100 Saf DXIL + Tam Model + PRELUDE_RING             " -ForegroundColor Cyan
+Write-Host "      RX 7600 8GB | 1080p Hikaye Semasi + %100 Saf DXIL + Canli TR Altyazi  " -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
 Write-Host "  Profil    : $profileName" -ForegroundColor Green
 Write-Host "  Shader    : %100 Saf DXIL (AMBIENT=0.85 | AIR=0.25 | RT_SKIP + CUTSCENE_FAST)" -ForegroundColor Yellow
+Write-Host "  FPS/GPU   : INDIRECT_BATCH=2 | CLAMP_WAITS=0 | CARD_AWAKE=1 | SETTLE=3500ms" -ForegroundColor Green
 Write-Host "  Modeller  : Cilt Bake Korumasi + CATCHUP=1 + TX Tam Cozunurluk (Dinamik DXGI)" -ForegroundColor Cyan
+Write-Host "  Altyazi   : Canli Sansursuz Turkce ACIK (F8 ac/kapa | tr_subtitles_cache.json)" -ForegroundColor White
 Write-Host "  HUD       : Sol Ust FPS / Grafik / VRAM / CPU / RAM ACIK (F3 ile ac/kapa)" -ForegroundColor Magenta
 Write-Host "  RAM/VRAM  : Spotify/Discord/Brave/Chrome otomatik kapatildi + PRELUDE_RING" -ForegroundColor Cyan
 Write-Host "============================================================================" -ForegroundColor Magenta
